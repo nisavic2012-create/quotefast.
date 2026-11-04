@@ -36,7 +36,7 @@ def read_rfq(file):
 
     if name.endswith((".xlsx", ".xls")):
         if name.endswith(".xlsx"):
-            df = pd.read_excel(file, engine="openpyxl")
+            df = pd.read_excel(file, engine="openpyxl", header=None)
         else:
             df = pd.read_excel(file)
         return df.to_csv(index=False, header=False)
