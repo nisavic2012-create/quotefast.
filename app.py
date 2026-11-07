@@ -11,6 +11,7 @@ st.caption('From RFQ to Quotation in Minutes — v0.8')
 st.warning('Prototype: rule-based suggestions are not technical certification. Verify all specifications manually.')
 
 
+
 def norm(value):
     return re.sub(r'\s+', ' ', str(value).lower().strip())
 
