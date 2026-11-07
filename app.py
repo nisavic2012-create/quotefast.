@@ -1,15 +1,15 @@
 import io
 import re
 from difflib import SequenceMatcher
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title='QF | QuoteFast', page_icon='⚡', layout='wide')
 st.title('⚡ QF | QuoteFast')
-st.caption('From RFQ to Quotation in Minutes — v0.8')
+st.caption('From RFQ to Quotation in Minutes — v0.8.1')
 st.warning('Prototype: rule-based suggestions are not technical certification. Verify all specifications manually.')
-
 
 
 def norm(value):
@@ -238,7 +238,7 @@ def commercial_excel(lines, meta, currency):
         info = dict(meta, currency=currency)
         for row_no, (label, key) in enumerate(fields, 3):
             ws.cell(row_no, 1, label).font = Font(bold=True)
-            ws.cell(row_no, 2, str(info.get(key, '')))
+            ws.cell(row_no, 2, str(info.get(key, '') or ''))
         header_row = 13
         for cell in ws[header_row]:
             cell.fill = PatternFill('solid', fgColor='17365D')
@@ -288,10 +288,17 @@ def commercial_pdf(lines, meta, currency, logo_bytes=None):
         except Exception:
             pass
     story += [para('QUOTATION', heading), para('DRAFT — SUBJECT TO FINAL COMMERCIAL AND TECHNICAL REVIEW', small), Spacer(1, 5*mm)]
-    for label, key in [('Seller', 'seller'), ('Customer', 'customer'), ('Quotation No.', 'number'),
-                       ('Date', 'date'), ('Valid Until', 'valid_until'), ('Delivery', 'delivery'),
-                       ('Payment', 'payment')]:
-        story.append(para(f'{label}: {meta.get(key, "")}'))
+    parties = Table([[para('FROM / SELLER', small), para('BILL TO / CUSTOMER', small)],
+                     [para(meta['seller']), para(meta['customer'])]],
+                    colWidths=[89*mm, 89*mm], hAlign='LEFT')
+    parties.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#E9F0F8')),
+                                 ('VALIGN',(0,0),(-1,-1),'TOP'),
+                                 ('TOPPADDING',(0,0),(-1,-1),7),
+                                 ('BOTTOMPADDING',(0,0),(-1,-1),7)]))
+    story.extend([parties, Spacer(1, 6*mm)])
+    for label, key in [('Quotation No.', 'number'), ('Date', 'date'), ('Valid Until', 'valid_until')]:
+        if meta.get(key):
+            story.append(para(f'{label}: {meta[key]}', small))
     story.append(Spacer(1, 6*mm))
     widths = [11*mm, 20*mm, 76*mm, 16*mm, 26*mm, 29*mm]
     data = [[para(x, small) for x in ['No.', 'SKU', 'Description', 'Qty', f'Unit ({currency})', f'Total ({currency})']]]
@@ -311,8 +318,13 @@ def commercial_pdf(lines, meta, currency, logo_bytes=None):
     # Header paragraphs need explicit white text; a cell-level TEXTCOLOR doesn't override Paragraph styling.
     for cell in data[0]:
         cell.style = ParagraphStyle('QFHeader', parent=small, textColor=colors.white, fontName='Helvetica-Bold')
-    story.extend([table, Spacer(1, 7*mm), para('Notes: ' + (meta.get('notes') or 'None'), small),
-                  para('Only manually approved, rule-matched items are included. Verify all specifications before issue.', small)])
+    story.extend([table, Spacer(1, 7*mm)])
+    for label, key in [('Delivery terms', 'delivery'), ('Payment terms', 'payment'), ('Additional notes', 'notes')]:
+        value = str(meta.get(key) or '').strip()
+        if value:
+            story.append(para(f'{label}: {value}', small))
+    story.append(Spacer(1, 4*mm))
+    story.append(para('Only manually approved, rule-matched items are included. Verify all specifications before issue.', small))
     doc.build(story)
     return output.getvalue()
 
@@ -429,7 +441,7 @@ if 'draft' in st.session_state:
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
-    st.subheader('6. Professional Quotation — v0.8')
+    st.subheader('6. Professional Quotation — v0.8.1.1')
     st.caption('Customer-facing documents include only approved lines marked Compatible. Technical deviations stay in the internal workbook.')
     with st.expander('Quotation details', expanded=True):
         left, right = st.columns(2)
@@ -437,7 +449,7 @@ if 'draft' in st.session_state:
             seller = st.text_area('Seller / company details', placeholder='Company name\nAddress\nEmail', key='qf_seller')
             number = st.text_input('Quotation number', value='QF-001', key='qf_number')
             delivery = st.text_input('Delivery terms', placeholder='e.g. 4–6 weeks, EXW', key='qf_delivery')
-            valid_until = st.date_input('Valid until', key='qf_valid')
+            valid_until = st.date_input('Valid until', value=date.today() + timedelta(days=30), key='qf_valid')
         with right:
             customer = st.text_area('Customer details', placeholder='Customer company\nAddress\nContact', key='qf_customer')
             date = st.date_input('Quotation date', key='qf_date')
@@ -453,23 +465,34 @@ if 'draft' in st.session_state:
                 'date': str(date), 'valid_until': str(valid_until),
                 'delivery': delivery, 'payment': payment, 'notes': notes}
         st.metric('Customer quotation total', f"{currency} {approved_lines['Total'].sum():,.2f}")
-        if not seller.strip() or not customer.strip():
-            st.warning('Enter seller and customer details before sending the quotation to a customer.')
+        required_missing = []
+        if not seller.strip():
+            required_missing.append('Seller / company details')
+        if not customer.strip():
+            required_missing.append('Customer details')
+        if not number.strip():
+            required_missing.append('Quotation number')
+        if valid_until < date:
+            required_missing.append('Valid until must not precede quotation date')
+        if required_missing:
+            st.error('Complete required fields before exporting: ' + ', '.join(required_missing))
+        else:
+            st.success('Required quotation details complete. Exports are ready.')
         try:
             pdf = commercial_pdf(approved_lines, meta, currency, logo.getvalue() if logo else None)
             xlsx = commercial_excel(approved_lines, meta, currency)
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button('Download Professional Quotation (PDF)', pdf,
-                                   file_name='QuoteFast_v08_Quotation.pdf', mime='application/pdf')
+                                   file_name='QuoteFast_v081_Quotation.pdf', mime='application/pdf', disabled=bool(required_missing))
             with c2:
                 st.download_button('Download Professional Quotation (Excel)', xlsx,
-                                   file_name='QuoteFast_v08_Quotation.xlsx',
-                                   mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                                   file_name='QuoteFast_v081_Quotation.xlsx',
+                                   mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', disabled=bool(required_missing))
         except ImportError as exc:
             st.error(f'Missing Python dependency: {exc}. Add reportlab to requirements.txt.')
         except Exception as exc:
             st.error(f'Could not create quotation: {exc}')
 
 st.divider()
-st.caption('QuoteFast v0.8 — rule-based prototype. Unrecognized requirements may be missed; no technical substitution is automatically authorized.')
+st.caption('QuoteFast v0.8.1 — rule-based prototype. Unrecognized requirements may be missed; no technical substitution is automatically authorized.')
