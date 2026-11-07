@@ -8,7 +8,7 @@ import streamlit as st
 
 st.set_page_config(page_title='QF | QuoteFast', page_icon='⚡', layout='wide')
 st.title('⚡ QF | QuoteFast')
-st.caption('From RFQ to Quotation in Minutes — v0.9.2')
+st.caption('From RFQ to Quotation in Minutes — v0.9.3')
 st.warning('Prototype: rule-based suggestions are not technical certification. Verify all specifications manually.')
 
 
@@ -533,7 +533,7 @@ if 'draft' in st.session_state:
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
-    st.subheader('6. Professional Quotation — v0.9.2')
+    st.subheader('6. Professional Quotation — v0.9.3')
     st.caption('Customer-facing documents include only approved lines marked Compatible. Technical deviations stay in the internal workbook.')
     with st.expander('Quotation details', expanded=True):
         left, right = st.columns(2)
