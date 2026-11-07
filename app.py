@@ -207,6 +207,26 @@ def general_compliance(request_text, offered_text):
     return 'Compatible', 'Exact normalized description; manual verification still required', pd.DataFrame(details)
 
 
+
+def safe_compliance(request_text, offered_text):
+    """Mode-independent safety check. Unrecognized categories require exact descriptions."""
+    industrial_req = specs(request_text).get('family')
+    industrial_off = specs(offered_text).get('family')
+    if industrial_req and industrial_off and industrial_req == industrial_off:
+        status, note, details = compliance(request_text, offered_text)
+        # General numeric attributes are checked too, even in industrial mode.
+        req_attrs = general_attributes(request_text)
+        off_attrs = general_attributes(offered_text)
+        conflicts = []
+        for label, value in req_attrs.items():
+            if label in off_attrs and not equivalent(value, off_attrs[label]):
+                conflicts.append(f"{label}: requested {value}, offered {off_attrs[label]}")
+        if conflicts:
+            return 'Non-compliant', '; '.join(conflicts), details
+        return status, note, details
+    # No recognized matching industrial family: conservative general-product check.
+    return general_compliance(request_text, offered_text)
+
 def find_general_product(sku, description, catalogue):
     if sku:
         found = catalogue[catalogue['SKU'] == sku.upper()]
@@ -286,8 +306,7 @@ def commercial_lines(result, mode='Industrial piping & valves'):
     for index, row in result.iterrows():
         if not safe.loc[index]:
             continue
-        checker = general_compliance if mode.startswith('General') else compliance
-        status, _, _ = checker(str(row['Requested Description']), str(row['Matched Description']))
+        status, _, _ = safe_compliance(str(row['Requested Description']), str(row['Matched Description']))
         if status != 'Compatible':
             safe.loc[index] = False
     return result.loc[safe].copy()
@@ -400,7 +419,7 @@ def commercial_pdf(lines, meta, currency, logo_bytes=None):
     return output.getvalue()
 
 industry_mode = st.selectbox('Product matching mode', ['Industrial piping & valves', 'General products (conservative matching)'], help='General mode allows exact-description matching; similar descriptions require manual review.')
-st.caption('General mode is a catalogue matching aid, not technical certification.')
+st.caption('Matching mode affects suggestions only. Final compliance checks are independent of mode.')
 catalogue_file = st.file_uploader('1. Upload catalogue (CSV or Excel)', type=['csv', 'xlsx'])
 rfq_file = st.file_uploader('2. Upload RFQ (Excel, CSV, PDF, Word)', type=['xlsx', 'csv', 'pdf', 'docx'])
 rfq_text = st.text_area('Or paste RFQ lines', height=140, placeholder='Gate valve, 4 inch, Class 600, 5 pcs')
@@ -461,7 +480,7 @@ if 'draft' in st.session_state:
             line['Matched Description'] = product['Description']
             line['Unit Price'] = product['Unit Price']
             if line['Requested Description']:
-                status, note, details = (general_compliance if industry_mode.startswith('General') else compliance)(line['Requested Description'], product['Description'])
+                status, note, details = safe_compliance(line['Requested Description'], product['Description'])
             else:
                 status, note, details = 'Missing Information', 'RFQ contains SKU only; verify original specification', pd.DataFrame()
         else:
@@ -510,7 +529,7 @@ if 'draft' in st.session_state:
         st.warning(f"{int((~valid).sum())} line(s) remain unapproved. Do not issue as a final quotation.")
     st.download_button('Download Draft + Compliance + Deviations (Excel)',
                        excel_export(result, matrix, deviations, currency),
-                       file_name='QuoteFast_v092_Draft.xlsx',
+                       file_name='QuoteFast_v093_Draft.xlsx',
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
@@ -557,10 +576,10 @@ if 'draft' in st.session_state:
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button('Download Professional Quotation (PDF)', pdf,
-                                   file_name='QuoteFast_v092_Quotation.pdf', mime='application/pdf', disabled=bool(required_missing))
+                                   file_name='QuoteFast_v093_Quotation.pdf', mime='application/pdf', disabled=bool(required_missing))
             with c2:
                 st.download_button('Download Professional Quotation (Excel)', xlsx,
-                                   file_name='QuoteFast_v092_Quotation.xlsx',
+                                   file_name='QuoteFast_v093_Quotation.xlsx',
                                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', disabled=bool(required_missing))
         except ImportError as exc:
             st.error(f'Missing Python dependency: {exc}. Add reportlab to requirements.txt.')
@@ -568,4 +587,4 @@ if 'draft' in st.session_state:
             st.error(f'Could not create quotation: {exc}')
 
 st.divider()
-st.caption('QuoteFast v0.9.2 — rule-based prototype. General mode uses exact-description matching, not engineering verification. Human approval required.')
+st.caption('QuoteFast v0.9.3 — rule-based prototype. General mode uses exact-description matching, not engineering verification. Human approval required.')
