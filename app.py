@@ -8,7 +8,7 @@ import streamlit as st
 
 st.set_page_config(page_title='QF | QuoteFast', page_icon='⚡', layout='wide')
 st.title('⚡ QF | QuoteFast')
-st.caption('From RFQ to Quotation in Minutes — v0.8.1')
+st.caption('From RFQ to Quotation in Minutes — v0.9.1')
 st.warning('Prototype: rule-based suggestions are not technical certification. Verify all specifications manually.')
 
 
@@ -159,6 +159,38 @@ def compliance(request_text, offered_text):
     if missing:
         return 'Missing Information', 'Catalogue missing: ' + ', '.join(missing), pd.DataFrame(details)
     return 'Compatible', 'Recognized parameters match; manual verification required', pd.DataFrame(details)
+
+
+def general_compliance(request_text, offered_text):
+    """Conservative general-purpose matching: only identical descriptions pass automatically."""
+    req, off = norm(request_text), norm(offered_text)
+    if not req:
+        return 'Missing Information', 'No RFQ description; verify SKU and specification manually', pd.DataFrame()
+    if req == off:
+        status, note = 'Compatible', 'Exact normalized description; manual verification still required'
+    else:
+        status, note = 'Missing Information', 'Descriptions differ; manual product/specification review required'
+    return status, note, pd.DataFrame([{
+        'Parameter': 'Full product description', 'Requested': request_text,
+        'Offered': offered_text, 'Result': 'Matched' if req == off else 'Missing Information'
+    }])
+
+
+def find_general_product(sku, description, catalogue):
+    if sku:
+        found = catalogue[catalogue['SKU'] == sku.upper()]
+        if len(found) == 1:
+            return found.iloc[0], 100, 'Exact SKU — verify specification', False
+        return None, 0, 'Duplicate SKU' if len(found) > 1 else 'SKU not found', False
+    if not description or catalogue.empty:
+        return None, 0, 'No description or catalogue', False
+    ranked = [(SequenceMatcher(None, norm(description), norm(row['Description'])).ratio(), row)
+              for _, row in catalogue.iterrows()]
+    score, product = max(ranked, key=lambda x: x[0])
+    if score < 0.55:
+        return None, round(score * 100), 'No sufficiently similar candidate', False
+    exact = norm(description) == norm(product['Description'])
+    return product, round(score * 100), 'Exact description' if exact else 'Candidate — review required', not exact
 
 
 def find_product(sku, description, catalogue):
@@ -328,13 +360,15 @@ def commercial_pdf(lines, meta, currency, logo_bytes=None):
     doc.build(story)
     return output.getvalue()
 
+industry_mode = st.selectbox('Product matching mode', ['Industrial piping & valves', 'General products (conservative matching)'], help='General mode allows exact-description matching; similar descriptions require manual review.')
+st.caption('General mode is a catalogue matching aid, not technical certification.')
 catalogue_file = st.file_uploader('1. Upload catalogue (CSV or Excel)', type=['csv', 'xlsx'])
 rfq_file = st.file_uploader('2. Upload RFQ (Excel, CSV, PDF, Word)', type=['xlsx', 'csv', 'pdf', 'docx'])
 rfq_text = st.text_area('Or paste RFQ lines', height=140, placeholder='Gate valve, 4 inch, Class 600, 5 pcs')
 currency = st.selectbox('Currency', ['USD', 'EUR', 'GBP'])
 
 signature = (catalogue_file.getvalue() if catalogue_file else None,
-             rfq_file.getvalue() if rfq_file else None, rfq_text, currency)
+             rfq_file.getvalue() if rfq_file else None, rfq_text, currency, industry_mode)
 if st.session_state.get('signature') != signature:
     st.session_state['signature'] = signature
     for key in ['draft', 'editor', 'catalogue_data']:
@@ -356,7 +390,7 @@ if st.button('Generate Draft Quotation', type='primary'):
             else:
                 rows = []
                 for _, item in rfq.iterrows():
-                    product, score, note, alternative = find_product(item['Requested SKU'], item['Requested Description'], catalogue)
+                    product, score, note, alternative = (find_general_product if industry_mode.startswith('General') else find_product)(item['Requested SKU'], item['Requested Description'], catalogue)
                     rows.append({'Requested SKU': item['Requested SKU'],
                                  'Requested Description': item['Requested Description'],
                                  'Quantity': item['Quantity'],
@@ -371,7 +405,7 @@ if st.button('Generate Draft Quotation', type='primary'):
 
 if 'draft' in st.session_state:
     st.subheader('3. Review and edit draft quotation')
-    st.caption('Change Matched SKU to select another product. Non-compliant alternatives cannot be approved.')
+    st.caption('Change Matched SKU to select another product. Only Compatible lines can be approved. General-mode similar descriptions require review.')
     edited = st.data_editor(st.session_state['draft'], hide_index=True, num_rows='fixed',
                             disabled=['Requested SKU', 'Requested Description', 'Matched Description',
                                       'Unit Price', 'Similarity %', 'Match Note'],
@@ -388,7 +422,7 @@ if 'draft' in st.session_state:
             line['Matched Description'] = product['Description']
             line['Unit Price'] = product['Unit Price']
             if line['Requested Description']:
-                status, note, details = compliance(line['Requested Description'], product['Description'])
+                status, note, details = (general_compliance if industry_mode.startswith('General') else compliance)(line['Requested Description'], product['Description'])
             else:
                 status, note, details = 'Missing Information', 'RFQ contains SKU only; verify original specification', pd.DataFrame()
         else:
@@ -403,7 +437,7 @@ if 'draft' in st.session_state:
         line['Unit Price'] = pd.to_numeric(line['Unit Price'], errors='coerce')
         line['Total'] = line['Quantity'] * line['Unit Price']
         # Even if a user checks Approved, known technical conflicts are forcibly excluded.
-        line['Approved'] = bool(line.get('Approved', False)) and status != 'Non-compliant' and len(matching) == 1
+        line['Approved'] = bool(line.get('Approved', False)) and status == 'Compatible' and len(matching) == 1
         rows.append(line)
         for _, detail in details.iterrows():
             matrix_rows.append({'RFQ Line': i + 1, 'Matched SKU': sku, **detail.to_dict()})
@@ -441,7 +475,7 @@ if 'draft' in st.session_state:
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
-    st.subheader('6. Professional Quotation — v0.8.1.1')
+    st.subheader('6. Professional Quotation — v0.9.1.1')
     st.caption('Customer-facing documents include only approved lines marked Compatible. Technical deviations stay in the internal workbook.')
     with st.expander('Quotation details', expanded=True):
         left, right = st.columns(2)
@@ -495,4 +529,4 @@ if 'draft' in st.session_state:
             st.error(f'Could not create quotation: {exc}')
 
 st.divider()
-st.caption('QuoteFast v0.8.1 — rule-based prototype. Unrecognized requirements may be missed; no technical substitution is automatically authorized.')
+st.caption('QuoteFast v0.9.1 — rule-based prototype. General mode uses exact-description matching, not engineering verification. Human approval required.')
