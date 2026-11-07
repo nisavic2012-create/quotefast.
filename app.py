@@ -1,4 +1,5 @@
 import io
+import json
 import re
 from difflib import SequenceMatcher
 from datetime import date, timedelta
@@ -8,7 +9,7 @@ import streamlit as st
 
 st.set_page_config(page_title='QF | QuoteFast', page_icon='⚡', layout='wide')
 st.title('⚡ QF | QuoteFast')
-st.caption('From RFQ to Quotation in Minutes — v0.9.3')
+st.caption('From RFQ to Quotation in Minutes — v0.10.0')
 st.warning('Prototype: rule-based suggestions are not technical certification. Verify all specifications manually.')
 
 
@@ -418,6 +419,43 @@ def commercial_pdf(lines, meta, currency, logo_bytes=None):
     doc.build(story)
     return output.getvalue()
 
+
+# Portable profiles and history; use JSON backup for persistence across sessions.
+if 'qf_records' not in st.session_state:
+    st.session_state['qf_records'] = {'supplier': '', 'customers': {}, 'history': []}
+records = st.session_state['qf_records']
+
+with st.expander('Customer & Supplier Management / Quotation History'):
+    uploaded_backup = st.file_uploader('Restore records from JSON', type=['json'], key='qf_backup')
+    if uploaded_backup and st.button('Import records'):
+        try:
+            loaded = json.loads(uploaded_backup.getvalue().decode('utf-8-sig'))
+            if not isinstance(loaded, dict) or not isinstance(loaded.get('customers'), dict) or not isinstance(loaded.get('history'), list):
+                raise ValueError('Invalid backup structure')
+            st.session_state['qf_records'] = {'supplier': str(loaded.get('supplier', '')),
+                                              'customers': loaded['customers'], 'history': loaded['history']}
+            st.rerun()
+        except (ValueError, TypeError, UnicodeDecodeError) as exc:
+            st.error(f'Invalid backup: {exc}')
+    profile = st.text_area('Supplier profile', value=records['supplier'], key='qf_profile')
+    if st.button('Save supplier profile'):
+        records['supplier'] = profile
+        st.success('Saved for this session. Download backup to keep it.')
+    name = st.text_input('Customer name', key='qf_customer_name')
+    details = st.text_area('Customer address / contact / email', key='qf_customer_profile')
+    if st.button('Save customer'):
+        if name.strip():
+            records['customers'][name.strip()] = details.strip()
+            st.success('Customer saved for this session.')
+        else:
+            st.warning('Enter a customer name.')
+    if records['history']:
+        st.dataframe(pd.DataFrame(records['history']), hide_index=True)
+    st.download_button('Download profiles and history (JSON)',
+                       json.dumps(records, ensure_ascii=False, indent=2).encode('utf-8'),
+                       'QuoteFast_Records_Backup.json', 'application/json')
+st.caption('Profiles/history remain in the current session only. Download JSON backup; permanent cloud storage is not yet configured.')
+
 industry_mode = st.selectbox('Product matching mode', ['Industrial piping & valves', 'General products (conservative matching)'], help='General mode allows exact-description matching; similar descriptions require manual review.')
 st.caption('Matching mode affects suggestions only. Final compliance checks are independent of mode.')
 catalogue_file = st.file_uploader('1. Upload catalogue (CSV or Excel)', type=['csv', 'xlsx'])
@@ -529,20 +567,25 @@ if 'draft' in st.session_state:
         st.warning(f"{int((~valid).sum())} line(s) remain unapproved. Do not issue as a final quotation.")
     st.download_button('Download Draft + Compliance + Deviations (Excel)',
                        excel_export(result, matrix, deviations, currency),
-                       file_name='QuoteFast_v093_Draft.xlsx',
+                       file_name='QuoteFast_v010_Draft.xlsx',
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
-    st.subheader('6. Professional Quotation — v0.9.3')
+    st.subheader('6. Professional Quotation — v0.10.0')
     st.caption('Customer-facing documents include only approved lines marked Compatible. Technical deviations stay in the internal workbook.')
     with st.expander('Quotation details', expanded=True):
         left, right = st.columns(2)
         with left:
+            if st.button('Load saved supplier'):
+                st.session_state['qf_seller'] = records['supplier']
             seller = st.text_area('Seller / company details', placeholder='Company name\nAddress\nEmail', key='qf_seller')
             number = st.text_input('Quotation number', value='QF-001', key='qf_number')
             delivery = st.text_input('Delivery terms', placeholder='e.g. 4–6 weeks, EXW', key='qf_delivery')
             valid_until = st.date_input('Valid until', value=date.today() + timedelta(days=30), key='qf_valid')
         with right:
+            customer_choice = st.selectbox('Saved customers', ['— Select —'] + sorted(records['customers']))
+            if st.button('Load selected customer') and customer_choice != '— Select —':
+                st.session_state['qf_customer'] = customer_choice + '\n' + records['customers'][customer_choice]
             customer = st.text_area('Customer details', placeholder='Customer company\nAddress\nContact', key='qf_customer')
             date = st.date_input('Quotation date', key='qf_date')
             payment = st.text_input('Payment terms', placeholder='e.g. 30 days net', key='qf_payment')
@@ -570,16 +613,22 @@ if 'draft' in st.session_state:
             st.error('Complete required fields before exporting: ' + ', '.join(required_missing))
         else:
             st.success('Required quotation details complete. Exports are ready.')
+            if st.button('Save quotation to history'):
+                records['history'].append({'Quotation No.': number, 'Date': str(date),
+                    'Customer': customer.splitlines()[0], 'Currency': currency,
+                    'Total': round(float(approved_lines['Total'].sum()), 2),
+                    'Approved lines': int(len(approved_lines))})
+                st.success('Saved for this session. Download JSON backup to retain it.')
         try:
             pdf = commercial_pdf(approved_lines, meta, currency, logo.getvalue() if logo else None)
             xlsx = commercial_excel(approved_lines, meta, currency)
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button('Download Professional Quotation (PDF)', pdf,
-                                   file_name='QuoteFast_v093_Quotation.pdf', mime='application/pdf', disabled=bool(required_missing))
+                                   file_name='QuoteFast_v010_Quotation.pdf', mime='application/pdf', disabled=bool(required_missing))
             with c2:
                 st.download_button('Download Professional Quotation (Excel)', xlsx,
-                                   file_name='QuoteFast_v093_Quotation.xlsx',
+                                   file_name='QuoteFast_v010_Quotation.xlsx',
                                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', disabled=bool(required_missing))
         except ImportError as exc:
             st.error(f'Missing Python dependency: {exc}. Add reportlab to requirements.txt.')
@@ -587,4 +636,4 @@ if 'draft' in st.session_state:
             st.error(f'Could not create quotation: {exc}')
 
 st.divider()
-st.caption('QuoteFast v0.9.3 — rule-based prototype. General mode uses exact-description matching, not engineering verification. Human approval required.')
+st.caption('QuoteFast v0.10.0 — rule-based prototype. General mode uses exact-description matching, not engineering verification. Human approval required.')
