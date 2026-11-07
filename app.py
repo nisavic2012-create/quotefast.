@@ -7,7 +7,7 @@ import streamlit as st
 
 st.set_page_config(page_title='QF | QuoteFast', page_icon='⚡', layout='wide')
 st.title('⚡ QF | QuoteFast')
-st.caption('From RFQ to Quotation in Minutes — v0.7')
+st.caption('From RFQ to Quotation in Minutes — v0.8')
 st.warning('Prototype: rule-based suggestions are not technical certification. Verify all specifications manually.')
 
 
@@ -211,6 +211,110 @@ def excel_export(df, matrix, deviations, currency):
     return output.getvalue()
 
 
+
+
+def commercial_lines(result):
+    """Only user-approved lines without known conflicts or unresolved fields."""
+    safe = result['Approved'].eq(True) & result['Compliance'].eq('Compatible')
+    safe &= result['Matched SKU'].astype(str).str.strip().ne('')
+    safe &= result['Quantity'].gt(0) & result['Unit Price'].ge(0)
+    return result.loc[safe].copy()
+
+
+def commercial_excel(lines, meta, currency):
+    output = io.BytesIO()
+    cols = ['Matched SKU', 'Matched Description', 'Quantity', 'Unit Price', 'Total']
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        lines[cols].rename(columns={'Matched SKU': 'SKU', 'Matched Description': 'Description'}).to_excel(
+            writer, sheet_name='Quotation', index=False, startrow=12)
+        ws = writer.sheets['Quotation']
+        from openpyxl.styles import Font, PatternFill, Alignment
+        ws['A1'] = 'QUOTATION — DRAFT / SUBJECT TO FINAL REVIEW'
+        ws['A1'].font = Font(size=16, bold=True, color='17365D')
+        fields = [('Seller', 'seller'), ('Customer', 'customer'), ('Quotation No.', 'number'),
+                  ('Date', 'date'), ('Valid Until', 'valid_until'), ('Delivery', 'delivery'),
+                  ('Payment', 'payment'), ('Currency', 'currency'), ('Notes', 'notes')]
+        info = dict(meta, currency=currency)
+        for row_no, (label, key) in enumerate(fields, 3):
+            ws.cell(row_no, 1, label).font = Font(bold=True)
+            ws.cell(row_no, 2, str(info.get(key, '')))
+        header_row = 13
+        for cell in ws[header_row]:
+            cell.fill = PatternFill('solid', fgColor='17365D')
+            cell.font = Font(bold=True, color='FFFFFF')
+        for col, width in {'A': 18, 'B': 62, 'C': 16, 'D': 18, 'E': 20}.items():
+            ws.column_dimensions[col].width = width
+        for r in range(14, 14 + len(lines)):
+            ws.cell(r, 4).number_format = '#,##0.00'
+            ws.cell(r, 5).number_format = '#,##0.00'
+        total_row = 14 + len(lines)
+        ws.cell(total_row, 4, 'TOTAL').font = Font(bold=True)
+        ws.cell(total_row, 5, float(lines['Total'].sum())).font = Font(bold=True)
+        ws.cell(total_row, 5).number_format = '#,##0.00'
+        ws.freeze_panes = 'C14'
+        ws.print_options.horizontalCentered = True
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.page_setup.fitToWidth = 1
+    return output.getvalue()
+
+
+def commercial_pdf(lines, meta, currency, logo_bytes=None):
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, KeepTogether
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_RIGHT
+    from reportlab.lib.utils import ImageReader
+    from reportlab.lib.units import mm
+    from xml.sax.saxutils import escape
+    output = io.BytesIO()
+    doc = SimpleDocTemplate(output, pagesize=(210*mm, 297*mm), leftMargin=16*mm,
+                            rightMargin=16*mm, topMargin=17*mm, bottomMargin=17*mm)
+    styles = getSampleStyleSheet()
+    body = ParagraphStyle('QFBody', parent=styles['BodyText'], fontSize=9, leading=12, spaceAfter=4)
+    small = ParagraphStyle('QFSmall', parent=body, fontSize=8, leading=10)
+    heading = ParagraphStyle('QFHeading', parent=styles['Heading1'], fontSize=19, textColor=colors.HexColor('#17365D'))
+    def para(value, style=body):
+        return Paragraph(escape(str(value or '')).replace('\n', '<br/>'), style)
+    story = []
+    if logo_bytes:
+        try:
+            img = Image(io.BytesIO(logo_bytes))
+            iw, ih = ImageReader(io.BytesIO(logo_bytes)).getSize()
+            factor = min(42*mm / iw, 18*mm / ih)
+            img.drawWidth, img.drawHeight = iw * factor, ih * factor
+            story.append(img)
+            story.append(Spacer(1, 5*mm))
+        except Exception:
+            pass
+    story += [para('QUOTATION', heading), para('DRAFT — SUBJECT TO FINAL COMMERCIAL AND TECHNICAL REVIEW', small), Spacer(1, 5*mm)]
+    for label, key in [('Seller', 'seller'), ('Customer', 'customer'), ('Quotation No.', 'number'),
+                       ('Date', 'date'), ('Valid Until', 'valid_until'), ('Delivery', 'delivery'),
+                       ('Payment', 'payment')]:
+        story.append(para(f'{label}: {meta.get(key, "")}'))
+    story.append(Spacer(1, 6*mm))
+    widths = [11*mm, 20*mm, 76*mm, 16*mm, 26*mm, 29*mm]
+    data = [[para(x, small) for x in ['No.', 'SKU', 'Description', 'Qty', f'Unit ({currency})', f'Total ({currency})']]]
+    for no, (_, item) in enumerate(lines.iterrows(), 1):
+        data.append([para(no, small), para(item['Matched SKU'], small), para(item['Matched Description'], small),
+                     para(f'{float(item["Quantity"]):g}', small),
+                     para(f'{float(item["Unit Price"]):,.2f}', small), para(f'{float(item["Total"]):,.2f}', small)])
+    data.append(['', '', '', '', para('TOTAL', small), para(f'{float(lines["Total"].sum()):,.2f}', small)])
+    table = Table(data, colWidths=widths, repeatRows=1, hAlign='LEFT')
+    table.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor('#17365D')),
+                               ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                               ('ROWBACKGROUNDS', (0,1), (-1,-2), [colors.white, colors.HexColor('#F2F5F9')]),
+                               ('LINEBELOW', (0,0), (-1,-1), .25, colors.HexColor('#D5DCE5')),
+                               ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                               ('LEFTPADDING', (0,0), (-1,-1), 5), ('RIGHTPADDING', (0,0), (-1,-1), 5),
+                               ('TOPPADDING', (0,0), (-1,-1), 6), ('BOTTOMPADDING', (0,0), (-1,-1), 6)]))
+    # Header paragraphs need explicit white text; a cell-level TEXTCOLOR doesn't override Paragraph styling.
+    for cell in data[0]:
+        cell.style = ParagraphStyle('QFHeader', parent=small, textColor=colors.white, fontName='Helvetica-Bold')
+    story.extend([table, Spacer(1, 7*mm), para('Notes: ' + (meta.get('notes') or 'None'), small),
+                  para('Only manually approved, rule-matched items are included. Verify all specifications before issue.', small)])
+    doc.build(story)
+    return output.getvalue()
+
 catalogue_file = st.file_uploader('1. Upload catalogue (CSV or Excel)', type=['csv', 'xlsx'])
 rfq_file = st.file_uploader('2. Upload RFQ (Excel, CSV, PDF, Word)', type=['xlsx', 'csv', 'pdf', 'docx'])
 rfq_text = st.text_area('Or paste RFQ lines', height=140, placeholder='Gate valve, 4 inch, Class 600, 5 pcs')
@@ -323,5 +427,48 @@ if 'draft' in st.session_state:
                        file_name='QuoteFast_v07_Draft.xlsx',
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
+
+    st.subheader('6. Professional Quotation — v0.8')
+    st.caption('Customer-facing documents include only approved lines marked Compatible. Technical deviations stay in the internal workbook.')
+    with st.expander('Quotation details', expanded=True):
+        left, right = st.columns(2)
+        with left:
+            seller = st.text_area('Seller / company details', placeholder='Company name\nAddress\nEmail', key='qf_seller')
+            number = st.text_input('Quotation number', value='QF-001', key='qf_number')
+            delivery = st.text_input('Delivery terms', placeholder='e.g. 4–6 weeks, EXW', key='qf_delivery')
+            valid_until = st.date_input('Valid until', key='qf_valid')
+        with right:
+            customer = st.text_area('Customer details', placeholder='Customer company\nAddress\nContact', key='qf_customer')
+            date = st.date_input('Quotation date', key='qf_date')
+            payment = st.text_input('Payment terms', placeholder='e.g. 30 days net', key='qf_payment')
+            notes = st.text_area('Additional notes', key='qf_notes')
+        logo = st.file_uploader('Optional company logo (PNG/JPG)', type=['png', 'jpg', 'jpeg'], key='qf_logo')
+    approved_lines = commercial_lines(result)
+    st.caption(f'{len(approved_lines)} eligible approved line(s); {len(result)-len(approved_lines)} excluded from customer-facing quotation.')
+    if approved_lines.empty:
+        st.info('Approve at least one Compatible line above to generate a quotation.')
+    else:
+        meta = {'seller': seller, 'customer': customer, 'number': number,
+                'date': str(date), 'valid_until': str(valid_until),
+                'delivery': delivery, 'payment': payment, 'notes': notes}
+        st.metric('Customer quotation total', f"{currency} {approved_lines['Total'].sum():,.2f}")
+        if not seller.strip() or not customer.strip():
+            st.warning('Enter seller and customer details before sending the quotation to a customer.')
+        try:
+            pdf = commercial_pdf(approved_lines, meta, currency, logo.getvalue() if logo else None)
+            xlsx = commercial_excel(approved_lines, meta, currency)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button('Download Professional Quotation (PDF)', pdf,
+                                   file_name='QuoteFast_v08_Quotation.pdf', mime='application/pdf')
+            with c2:
+                st.download_button('Download Professional Quotation (Excel)', xlsx,
+                                   file_name='QuoteFast_v08_Quotation.xlsx',
+                                   mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        except ImportError as exc:
+            st.error(f'Missing Python dependency: {exc}. Add reportlab to requirements.txt.')
+        except Exception as exc:
+            st.error(f'Could not create quotation: {exc}')
+
 st.divider()
-st.caption('QuoteFast v0.7 — rule-based prototype. Unrecognized requirements may be missed; no technical substitution is automatically authorized.')
+st.caption('QuoteFast v0.8 — rule-based prototype. Unrecognized requirements may be missed; no technical substitution is automatically authorized.')
