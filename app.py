@@ -7,12 +7,12 @@ import streamlit as st
 
 st.set_page_config(page_title='QF | QuoteFast', page_icon='⚡', layout='wide')
 st.title('⚡ QF | QuoteFast')
-st.caption('From RFQ to Quotation in Minutes — v0.6')
-st.warning('Prototype: compliance is rule-based, not certification. Human verification is mandatory.')
+st.caption('From RFQ to Quotation in Minutes — v0.7')
+st.warning('Prototype: rule-based suggestions are not technical certification. Verify all specifications manually.')
 
 
-def norm(v):
-    return re.sub(r'\s+', ' ', str(v).lower().strip())
+def norm(value):
+    return re.sub(r'\s+', ' ', str(value).lower().strip())
 
 
 def colname(columns, choices):
@@ -151,47 +151,53 @@ def compliance(request_text, offered_text):
             state = 'Matched'
         else:
             state = 'Non-compliant'
-            conflicts.append(label)
+            conflicts.append(f'{label}: requested {r}, offered {o}')
         details.append({'Parameter': label, 'Requested': r or '—', 'Offered': o or '—', 'Result': state})
     if conflicts:
-        status = 'Non-compliant'
-        note = 'Conflicts: ' + ', '.join(conflicts)
-    elif missing:
-        status = 'Missing Information'
-        note = 'Catalogue missing: ' + ', '.join(missing)
-    else:
-        status = 'Compatible'
-        note = 'Recognized requirements match; manual verification still required'
-    return status, note, pd.DataFrame(details)
+        return 'Non-compliant', '; '.join(conflicts), pd.DataFrame(details)
+    if missing:
+        return 'Missing Information', 'Catalogue missing: ' + ', '.join(missing), pd.DataFrame(details)
+    return 'Compatible', 'Recognized parameters match; manual verification required', pd.DataFrame(details)
 
 
-def match_product(sku, description, catalogue):
+def find_product(sku, description, catalogue):
     if sku:
-        matches = catalogue[catalogue['SKU'] == sku.upper()]
-        if len(matches) != 1:
-            return None, 0, 'Duplicate SKU' if len(matches) > 1 else 'SKU not found'
-        return matches.iloc[0], 100, 'Exact SKU'
-    if not description:
-        return None, 0, 'No description'
-    candidates = []
+        found = catalogue[catalogue['SKU'] == sku.upper()]
+        if len(found) == 1:
+            return found.iloc[0], 100, 'Exact SKU', False
+        return None, 0, 'Duplicate SKU' if len(found) > 1 else 'SKU not found', False
+    if not description or catalogue.empty:
+        return None, 0, 'No description or catalogue', False
+    ranked = []
+    requested_family = specs(description)['family']
     for _, product in catalogue.iterrows():
-        status, _, _ = compliance(description, product['Description'])
+        offered_family = specs(product['Description'])['family']
+        # Never suggest a known different product family as an alternative.
+        if requested_family and offered_family and requested_family != offered_family:
+            continue
+        if requested_family and not offered_family:
+            continue
+        status, note, _ = compliance(description, product['Description'])
         score = SequenceMatcher(None, norm(description), norm(product['Description'])).ratio()
-        if status != 'Non-compliant':
-            candidates.append((score, product))
-    if not candidates:
-        return None, 0, 'No candidate without known conflicts'
-    score, product = max(candidates, key=lambda x: x[0])
-    if score < 0.40:
-        return None, round(score * 100), 'Low text similarity'
-    return product, round(score * 100), 'Suggested match'
+        conflict_count = note.count(';') + 1 if status == 'Non-compliant' else 0
+        ranked.append((status, score, conflict_count, product))
+    compatible = [x for x in ranked if x[0] != 'Non-compliant' and x[1] >= 0.40]
+    if compatible:
+        status, score, _, product = max(compatible, key=lambda x: x[1])
+        return product, round(score * 100), 'Suggested match', False
+    alternatives = [x for x in ranked if x[0] == 'Non-compliant' and x[1] >= 0.40]
+    if alternatives:
+        status, score, _, product = max(alternatives, key=lambda x: (-x[2], x[1]))
+        return product, round(score * 100), 'Alternative — technical deviation', True
+    return None, 0, 'No reliable candidate', False
 
 
-def excel_export(df, matrix, currency):
+def excel_export(df, matrix, deviations, currency):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Draft Quotation')
         matrix.to_excel(writer, index=False, sheet_name='Compliance Matrix')
+        deviations.to_excel(writer, index=False, sheet_name='Technical Deviations')
         for sheet in writer.sheets.values():
             sheet.freeze_panes = 'A2'
             sheet.auto_filter.ref = sheet.dimensions
@@ -201,21 +207,21 @@ def excel_export(df, matrix, currency):
         sheet = writer.sheets['Draft Quotation']
         sheet.cell(len(df) + 3, 1, f'Currency: {currency}')
         sheet.cell(len(df) + 4, 1, 'DRAFT — HUMAN TECHNICAL APPROVAL REQUIRED')
+        sheet.cell(len(df) + 5, 1, 'NON-COMPLIANT ALTERNATIVES ARE NOT APPROVED QUOTATION ITEMS')
     return output.getvalue()
 
 
 catalogue_file = st.file_uploader('1. Upload catalogue (CSV or Excel)', type=['csv', 'xlsx'])
 rfq_file = st.file_uploader('2. Upload RFQ (Excel, CSV, PDF, Word)', type=['xlsx', 'csv', 'pdf', 'docx'])
-rfq_text = st.text_area('Or paste RFQ lines', height=140, placeholder='Gate valve, 4 inch, Class 300, 5 pcs')
+rfq_text = st.text_area('Or paste RFQ lines', height=140, placeholder='Gate valve, 4 inch, Class 600, 5 pcs')
 currency = st.selectbox('Currency', ['USD', 'EUR', 'GBP'])
 
 signature = (catalogue_file.getvalue() if catalogue_file else None,
              rfq_file.getvalue() if rfq_file else None, rfq_text, currency)
 if st.session_state.get('signature') != signature:
     st.session_state['signature'] = signature
-    st.session_state.pop('draft', None)
-    st.session_state.pop('editor', None)
-    st.session_state.pop('catalogue_data', None)
+    for key in ['draft', 'editor', 'catalogue_data']:
+        st.session_state.pop(key, None)
 
 if st.button('Generate Draft Quotation', type='primary'):
     for key in ['draft', 'editor', 'catalogue_data']:
@@ -229,11 +235,11 @@ if st.button('Generate Draft Quotation', type='primary'):
             catalogue = parse_catalogue(catalogue_file)
             rfq = parse_rfq(rfq_file) if rfq_file else parse_lines(rfq_text)
             if rfq.empty:
-                st.error('No RFQ lines recognized. Example: Gate valve, 4 inch, Class 300, 5 pcs')
+                st.error('No RFQ lines recognized. Example: Gate valve, 4 inch, Class 600, 5 pcs')
             else:
                 rows = []
                 for _, item in rfq.iterrows():
-                    product, score, note = match_product(item['Requested SKU'], item['Requested Description'], catalogue)
+                    product, score, note, alternative = find_product(item['Requested SKU'], item['Requested Description'], catalogue)
                     rows.append({'Requested SKU': item['Requested SKU'],
                                  'Requested Description': item['Requested Description'],
                                  'Quantity': item['Quantity'],
@@ -248,13 +254,13 @@ if st.button('Generate Draft Quotation', type='primary'):
 
 if 'draft' in st.session_state:
     st.subheader('3. Review and edit draft quotation')
-    st.caption('Change Matched SKU to select another catalogue product. Description and price update automatically.')
+    st.caption('Change Matched SKU to select another product. Non-compliant alternatives cannot be approved.')
     edited = st.data_editor(st.session_state['draft'], hide_index=True, num_rows='fixed',
                             disabled=['Requested SKU', 'Requested Description', 'Matched Description',
                                       'Unit Price', 'Similarity %', 'Match Note'],
                             key='editor', use_container_width=True)
     catalogue = st.session_state['catalogue_data']
-    rows, matrix_rows = [], []
+    rows, matrix_rows, deviation_rows = [], [], []
     for i, row in edited.iterrows():
         line = row.to_dict()
         sku = str(line.get('Matched SKU') or '').strip().upper()
@@ -279,28 +285,43 @@ if 'draft' in st.session_state:
         line['Quantity'] = pd.to_numeric(line['Quantity'], errors='coerce')
         line['Unit Price'] = pd.to_numeric(line['Unit Price'], errors='coerce')
         line['Total'] = line['Quantity'] * line['Unit Price']
+        # Even if a user checks Approved, known technical conflicts are forcibly excluded.
         line['Approved'] = bool(line.get('Approved', False)) and status != 'Non-compliant' and len(matching) == 1
         rows.append(line)
         for _, detail in details.iterrows():
             matrix_rows.append({'RFQ Line': i + 1, 'Matched SKU': sku, **detail.to_dict()})
+            if detail['Result'] == 'Non-compliant':
+                deviation_rows.append({'RFQ Line': i + 1, 'Alternative SKU': sku,
+                                       'Requested Description': line['Requested Description'],
+                                       'Alternative Description': line['Matched Description'],
+                                       'Parameter': detail['Parameter'],
+                                       'Requested': detail['Requested'], 'Offered': detail['Offered'],
+                                       'Decision': 'NOT APPROVED — separate engineering review required'})
     result = pd.DataFrame(rows)
     matrix = pd.DataFrame(matrix_rows, columns=['RFQ Line', 'Matched SKU', 'Parameter', 'Requested', 'Offered', 'Result'])
+    deviations = pd.DataFrame(deviation_rows, columns=['RFQ Line', 'Alternative SKU', 'Requested Description',
+                      'Alternative Description', 'Parameter', 'Requested', 'Offered', 'Decision'])
     st.subheader('4. Technical Compliance Matrix')
     st.dataframe(result[['Requested Description', 'Matched SKU', 'Matched Description', 'Compliance', 'Compliance Note']],
                  hide_index=True, use_container_width=True)
     with st.expander('View parameter-by-parameter comparison', expanded=True):
         st.dataframe(matrix, hide_index=True, use_container_width=True)
+    st.subheader('5. Alternative Products & Technical Deviations')
+    if deviations.empty:
+        st.success('No known technical deviations among the selected products.')
+    else:
+        st.error(f'{len(deviations)} technical deviation(s) detected. These alternatives are not approved.')
+        st.dataframe(deviations, hide_index=True, use_container_width=True)
     valid = (result['Approved'] & result['Matched SKU'].astype(str).str.strip().ne('')
              & result['Quantity'].gt(0) & result['Unit Price'].ge(0))
     st.metric('Approved subtotal', f"{currency} {result.loc[valid, 'Total'].sum():,.2f}")
-    st.caption(f"Unapproved priced subtotal: {currency} {result.loc[~valid, 'Total'].sum():,.2f}")
+    st.caption(f"Unapproved priced subtotal (including alternatives): {currency} {result.loc[~valid, 'Total'].sum():,.2f}")
     if (~valid).any():
-        st.warning(f"{int((~valid).sum())} line(s) remain unapproved. Do not issue this draft as a final quotation.")
-    if (result['Compliance'] == 'Non-compliant').any():
-        st.error('Technical conflicts detected. Conflicting lines cannot be approved.')
-    st.download_button('Download Draft + Compliance Matrix (Excel)', excel_export(result, matrix, currency),
-                       file_name='QuoteFast_v06_Draft.xlsx',
+        st.warning(f"{int((~valid).sum())} line(s) remain unapproved. Do not issue as a final quotation.")
+    st.download_button('Download Draft + Compliance + Deviations (Excel)',
+                       excel_export(result, matrix, deviations, currency),
+                       file_name='QuoteFast_v07_Draft.xlsx',
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 st.divider()
-st.caption('QuoteFast v0.6 — rule-based comparison. Unknown or unrecognized requirements may not be detected.')
+st.caption('QuoteFast v0.7 — rule-based prototype. Unrecognized requirements may be missed; no technical substitution is automatically authorized.')
