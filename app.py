@@ -8,7 +8,7 @@ import streamlit as st
 
 st.set_page_config(page_title='QF | QuoteFast', page_icon='⚡', layout='wide')
 st.title('⚡ QF | QuoteFast')
-st.caption('From RFQ to Quotation in Minutes — v0.9.1')
+st.caption('From RFQ to Quotation in Minutes — v0.9.2')
 st.warning('Prototype: rule-based suggestions are not technical certification. Verify all specifications manually.')
 
 
@@ -161,19 +161,50 @@ def compliance(request_text, offered_text):
     return 'Compatible', 'Recognized parameters match; manual verification required', pd.DataFrame(details)
 
 
+def general_attributes(description):
+    """Conservative detection of explicitly stated general-product attributes."""
+    t = norm(description).replace('×', 'x')
+    patterns = {
+        'Power (W)': r'(?<![\w.])(\d+(?:\.\d+)?)\s*w\b',
+        'Voltage (V)': r'(?<![\w.])(\d+(?:\.\d+)?)\s*v\b',
+        'Current (A)': r'(?<![\w.])(\d+(?:\.\d+)?)\s*a\b',
+        'Capacity (mAh)': r'(?<![\w.])(\d+(?:\.\d+)?)\s*mah\b',
+        'Capacity (Ah)': r'(?<![\w.])(\d+(?:\.\d+)?)\s*ah\b',
+        'Length (m)': r'(?<![\w.])(\d+(?:\.\d+)?)\s*m\b',
+        'Length (mm)': r'(?<![\w.])(\d+(?:\.\d+)?)\s*mm\b',
+        'Socket count': r'(?<![\w.])(\d+)\s*sockets?\b',
+    }
+    return {name: match.group(1) for name, pattern in patterns.items()
+            if (match := re.search(pattern, t))}
+
+
 def general_compliance(request_text, offered_text):
-    """Conservative general-purpose matching: only identical descriptions pass automatically."""
     req, off = norm(request_text), norm(offered_text)
     if not req:
-        return 'Missing Information', 'No RFQ description; verify SKU and specification manually', pd.DataFrame()
-    if req == off:
-        status, note = 'Compatible', 'Exact normalized description; manual verification still required'
-    else:
-        status, note = 'Missing Information', 'Descriptions differ; manual product/specification review required'
-    return status, note, pd.DataFrame([{
-        'Parameter': 'Full product description', 'Requested': request_text,
-        'Offered': offered_text, 'Result': 'Matched' if req == off else 'Missing Information'
-    }])
+        return 'Missing Information', 'RFQ description missing; manual review required', pd.DataFrame()
+    requested, offered = general_attributes(request_text), general_attributes(offered_text)
+    details, conflicts, missing = [], [], []
+    for label, value in requested.items():
+        other = offered.get(label)
+        if other is None:
+            state = 'Missing Information'
+            missing.append(label)
+        elif equivalent(value, other):
+            state = 'Matched'
+        else:
+            state = 'Non-compliant'
+            conflicts.append(f'{label}: requested {value}, offered {other}')
+        details.append({'Parameter': label, 'Requested': value, 'Offered': other or '—', 'Result': state})
+    details.insert(0, {'Parameter': 'Full product description',
+                       'Requested': request_text, 'Offered': offered_text,
+                       'Result': 'Matched' if req == off else 'Review required'})
+    if conflicts:
+        return 'Non-compliant', '; '.join(conflicts), pd.DataFrame(details)
+    if missing:
+        return 'Missing Information', 'Offered description missing: ' + ', '.join(missing), pd.DataFrame(details)
+    if req != off:
+        return 'Missing Information', 'Descriptions differ; manual review required', pd.DataFrame(details)
+    return 'Compatible', 'Exact normalized description; manual verification still required', pd.DataFrame(details)
 
 
 def find_general_product(sku, description, catalogue):
@@ -246,11 +277,19 @@ def excel_export(df, matrix, deviations, currency):
 
 
 
-def commercial_lines(result):
-    """Only user-approved lines without known conflicts or unresolved fields."""
+def commercial_lines(result, mode='Industrial piping & valves'):
+    """Independent export gate: never trust the editor's Approved/Compliance flags alone."""
     safe = result['Approved'].eq(True) & result['Compliance'].eq('Compatible')
     safe &= result['Matched SKU'].astype(str).str.strip().ne('')
     safe &= result['Quantity'].gt(0) & result['Unit Price'].ge(0)
+    safe &= result['Requested Description'].astype(str).str.strip().ne('')
+    for index, row in result.iterrows():
+        if not safe.loc[index]:
+            continue
+        checker = general_compliance if mode.startswith('General') else compliance
+        status, _, _ = checker(str(row['Requested Description']), str(row['Matched Description']))
+        if status != 'Compatible':
+            safe.loc[index] = False
     return result.loc[safe].copy()
 
 
@@ -459,23 +498,23 @@ if 'draft' in st.session_state:
         st.dataframe(matrix, hide_index=True, use_container_width=True)
     st.subheader('5. Alternative Products & Technical Deviations')
     if deviations.empty:
-        st.success('No known technical deviations among the selected products.')
+        st.info('No recognized technical conflicts. Unresolved differences may still require review.')
     else:
         st.error(f'{len(deviations)} technical deviation(s) detected. These alternatives are not approved.')
         st.dataframe(deviations, hide_index=True, use_container_width=True)
-    valid = (result['Approved'] & result['Matched SKU'].astype(str).str.strip().ne('')
-             & result['Quantity'].gt(0) & result['Unit Price'].ge(0))
+    eligible_indices = commercial_lines(result, industry_mode).index
+    valid = result.index.isin(eligible_indices)
     st.metric('Approved subtotal', f"{currency} {result.loc[valid, 'Total'].sum():,.2f}")
     st.caption(f"Unapproved priced subtotal (including alternatives): {currency} {result.loc[~valid, 'Total'].sum():,.2f}")
     if (~valid).any():
         st.warning(f"{int((~valid).sum())} line(s) remain unapproved. Do not issue as a final quotation.")
     st.download_button('Download Draft + Compliance + Deviations (Excel)',
                        excel_export(result, matrix, deviations, currency),
-                       file_name='QuoteFast_v07_Draft.xlsx',
+                       file_name='QuoteFast_v092_Draft.xlsx',
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
-    st.subheader('6. Professional Quotation — v0.9.1.1')
+    st.subheader('6. Professional Quotation — v0.9.2')
     st.caption('Customer-facing documents include only approved lines marked Compatible. Technical deviations stay in the internal workbook.')
     with st.expander('Quotation details', expanded=True):
         left, right = st.columns(2)
@@ -490,7 +529,7 @@ if 'draft' in st.session_state:
             payment = st.text_input('Payment terms', placeholder='e.g. 30 days net', key='qf_payment')
             notes = st.text_area('Additional notes', key='qf_notes')
         logo = st.file_uploader('Optional company logo (PNG/JPG)', type=['png', 'jpg', 'jpeg'], key='qf_logo')
-    approved_lines = commercial_lines(result)
+    approved_lines = commercial_lines(result, industry_mode)
     st.caption(f'{len(approved_lines)} eligible approved line(s); {len(result)-len(approved_lines)} excluded from customer-facing quotation.')
     if approved_lines.empty:
         st.info('Approve at least one Compatible line above to generate a quotation.')
@@ -518,10 +557,10 @@ if 'draft' in st.session_state:
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button('Download Professional Quotation (PDF)', pdf,
-                                   file_name='QuoteFast_v081_Quotation.pdf', mime='application/pdf', disabled=bool(required_missing))
+                                   file_name='QuoteFast_v092_Quotation.pdf', mime='application/pdf', disabled=bool(required_missing))
             with c2:
                 st.download_button('Download Professional Quotation (Excel)', xlsx,
-                                   file_name='QuoteFast_v081_Quotation.xlsx',
+                                   file_name='QuoteFast_v092_Quotation.xlsx',
                                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', disabled=bool(required_missing))
         except ImportError as exc:
             st.error(f'Missing Python dependency: {exc}. Add reportlab to requirements.txt.')
@@ -529,4 +568,4 @@ if 'draft' in st.session_state:
             st.error(f'Could not create quotation: {exc}')
 
 st.divider()
-st.caption('QuoteFast v0.9.1 — rule-based prototype. General mode uses exact-description matching, not engineering verification. Human approval required.')
+st.caption('QuoteFast v0.9.2 — rule-based prototype. General mode uses exact-description matching, not engineering verification. Human approval required.')
