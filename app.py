@@ -560,47 +560,123 @@ st.caption('Profiles/history remain in the current session only. Download JSON b
 
 industry_mode = st.selectbox('Product matching mode', ['Industrial piping & valves', 'General products (conservative matching)'], help='General mode allows exact-description matching; similar descriptions require manual review.')
 st.caption('Matching mode affects suggestions only. Final compliance checks are independent of mode.')
-catalogue_file = st.file_uploader('1. Upload catalogue (CSV or Excel)', type=['csv', 'xlsx'])
+catalogue_files = st.file_uploader(
+    '1. Upload supplier catalogues (CSV or Excel)',
+    type=['csv', 'xlsx'],
+    accept_multiple_files=True
+)
 rfq_file = st.file_uploader('2. Upload RFQ (Excel, CSV, PDF, Word)', type=['xlsx', 'csv', 'pdf', 'docx'])
 rfq_text = st.text_area('Or paste RFQ lines', height=140, placeholder='Gate valve, 4 inch, Class 600, 5 pcs')
 currency = st.selectbox('Currency', ['USD', 'EUR', 'GBP'])
 
-signature = (catalogue_file.getvalue() if catalogue_file else None,
-             rfq_file.getvalue() if rfq_file else None, rfq_text, currency, industry_mode)
+signature = (
+    tuple((f.name, f.getvalue()) for f in catalogue_files),
+    rfq_file.getvalue() if rfq_file else None,
+    rfq_text,
+    currency,
+    industry_mode
+)
 if st.session_state.get('signature') != signature:
     st.session_state['signature'] = signature
-    for key in ['draft', 'editor', 'catalogue_data']:
-        st.session_state.pop(key, None)
+    for key in ['draft', 'editor', 'catalogue_data', 'supplier_comparison']:
+    st.session_state.pop(key, None)
 
 if st.button('Generate Draft Quotation', type='primary'):
-    for key in ['draft', 'editor', 'catalogue_data']:
+    for key in ['draft', 'editor', 'catalogue_data', 'supplier_comparison']:
         st.session_state.pop(key, None)
-    if not catalogue_file:
-        st.warning('Upload a catalogue first.')
+
+    if not catalogue_files:
+        st.warning('Upload at least one supplier catalogue first.')
     elif not rfq_file and not rfq_text.strip():
         st.warning('Upload an RFQ or paste RFQ lines.')
     else:
         try:
-            catalogue = parse_catalogue(catalogue_file)
+            catalogue_parts = []
+
+            for supplier_file in catalogue_files:
+                supplier_catalogue = parse_catalogue(supplier_file)
+
+                supplier_catalogue['Supplier'] = supplier_file.name
+                supplier_catalogue['Supplier SKU'] = supplier_catalogue['SKU']
+
+                supplier_catalogue['SKU'] = (
+                    'S' + str(len(catalogue_parts) + 1) + '-' +
+                    supplier_catalogue['SKU'].astype(str)
+                )
+
+                catalogue_parts.append(supplier_catalogue)
+
+            catalogue = pd.concat(catalogue_parts, ignore_index=True)
+
             rfq = parse_rfq(rfq_file) if rfq_file else parse_lines(rfq_text)
+
             if rfq.empty:
-                st.error('No RFQ lines recognized. Example: Gate valve, 4 inch, Class 600, 5 pcs')
+                st.error('No RFQ lines recognized.')
             else:
                 rows = []
+
                 for _, item in rfq.iterrows():
-                    product, score, note, alternative = (find_general_product if industry_mode.startswith('General') else find_product)(item['Requested SKU'], item['Requested Description'], catalogue)
-                    rows.append({'Requested SKU': item['Requested SKU'],
-                                 'Requested Description': item['Requested Description'],
-                                 'Quantity': item['Quantity'],
-                                 'Matched SKU': product['SKU'] if product is not None else '',
-                                 'Matched Description': product['Description'] if product is not None else '',
-                                 'Unit Price': float(product['Unit Price']) if product is not None and pd.notna(product['Unit Price']) else None,
-                                 'Similarity %': score, 'Match Note': note, 'Approved': False})
+                    finder = (
+                        find_general_product
+                        if industry_mode.startswith('General')
+                        else find_product
+                    )
+
+                    product, score, note, alternative = finder(
+                        item['Requested SKU'],
+                        item['Requested Description'],
+                        catalogue
+                    )
+
+                    rows.append({
+                        'Requested SKU': item['Requested SKU'],
+                        'Requested Description': item['Requested Description'],
+                        'Quantity': item['Quantity'],
+                        'Matched SKU': product['SKU'] if product is not None else '',
+                        'Matched Description': product['Description'] if product is not None else '',
+                        'Unit Price': (
+                            float(product['Unit Price'])
+                            if product is not None and pd.notna(product['Unit Price'])
+                            else None
+                        ),
+                        'Similarity %': score,
+                        'Match Note': note,
+                        'Approved': False
+                    })
+
                 st.session_state['catalogue_data'] = catalogue
+                st.session_state['supplier_comparison'] = catalogue.copy()
                 st.session_state['draft'] = pd.DataFrame(rows)
+
         except Exception as exc:
             st.error(f'Unable to process RFQ: {exc}')
 
+
+if 'supplier_comparison' in st.session_state:
+    st.subheader('Multi-Supplier Catalogue Comparison')
+
+    comparison = st.session_state['supplier_comparison']
+
+    columns = [
+        'Supplier',
+        'Supplier SKU',
+        'Description',
+        'Unit Price',
+        'Stock',
+        'Source File',
+        'Source Sheet',
+        'Source Row'
+    ]
+
+    available_columns = [
+        c for c in columns if c in comparison.columns
+    ]
+
+    st.dataframe(
+        comparison[available_columns],
+        hide_index=True,
+        use_container_width=True
+    )
 if 'draft' in st.session_state:
     st.subheader('3. Review and edit draft quotation')
     st.caption('Change Matched SKU to select another product. Only Compatible lines can be approved. General-mode similar descriptions require review.')
