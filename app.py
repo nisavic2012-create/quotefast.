@@ -35,18 +35,120 @@ def read_tabular(file, header=0):
     return pd.read_csv(data, dtype=str, header=header, encoding='utf-8-sig').fillna('')
 
 
+
 def parse_catalogue(file):
-    df = read_tabular(file)
-    sku = colname(df.columns, ['sku', 'product code', 'item code', 'part number', 'code'])
-    desc = colname(df.columns, ['description', 'product name', 'item name', 'product'])
-    price = colname(df.columns, ['unit price', 'price', 'rate'])
-    if not all([sku, desc, price]):
-        raise ValueError('Catalogue requires SKU, Description and Price columns.')
-    out = pd.DataFrame({
-        'SKU': df[sku].astype(str).str.strip().str.upper(),
-        'Description': df[desc].astype(str).str.strip(),
-        'Unit Price': pd.to_numeric(df[price].astype(str).str.replace(',', '', regex=False), errors='coerce'),
-    })
+    aliases = {
+        'SKU': [
+            'sku', 'product code', 'item code', 'part number',
+            'part no', 'part no.', 'code', 'item number',
+            'material code', 'article number', 'артикул',
+            'код товара', 'код', 'номер детали', 'šifra',
+            'sifra', 'kataloški broj'
+        ],
+        'Description': [
+            'description', 'product name', 'item name',
+            'product', 'item description', 'material description',
+            'наименование', 'описание', 'название товара',
+            'naziv', 'opis', 'naziv proizvoda'
+        ],
+        'Unit Price': [
+            'unit price', 'price', 'rate', 'usd/pc',
+            'price usd', 'unit cost', 'cost', 'цена',
+            'цена usd', 'цена за шт', 'cena',
+            'jedinična cena', 'jedinicna cena'
+        ],
+        'Stock': [
+            'stock', 'available qty', 'available quantity',
+            'inventory', 'balance', 'остаток',
+            'остаток на складе', 'наличие',
+            'stanje', 'zalihe', 'količina na stanju'
+        ]
+    }
+
+    if file.name.lower().endswith('.xlsx'):
+        sheets = pd.read_excel(
+            io.BytesIO(file.getvalue()),
+            sheet_name=None,
+            header=None,
+            dtype=str,
+            engine='openpyxl'
+        )
+    else:
+        sheets = {
+            'CSV': pd.read_csv(
+                io.BytesIO(file.getvalue()),
+                header=None,
+                dtype=str,
+                encoding='utf-8-sig'
+            )
+        }
+
+    candidates = []
+
+    for sheet_name, raw in sheets.items():
+        raw = raw.fillna('')
+
+        for header_index in range(min(20, len(raw))):
+            headers = [
+                str(value).strip()
+                for value in raw.iloc[header_index]
+            ]
+
+            mapping = {
+                field: colname(headers, choices)
+                for field, choices in aliases.items()
+            }
+
+            if not all(mapping.get(k) for k in
+                       ['SKU', 'Description', 'Unit Price']):
+                continue
+
+            df = raw.iloc[header_index + 1:].copy()
+            df.columns = headers
+
+            out = pd.DataFrame({
+                'SKU': df[mapping['SKU']].astype(str).str.strip().str.upper(),
+                'Description': df[mapping['Description']].astype(str).str.strip(),
+                'Unit Price': pd.to_numeric(
+                    df[mapping['Unit Price']]
+                    .astype(str)
+                    .str.replace(',', '', regex=False),
+                    errors='coerce'
+                )
+            })
+
+            if mapping['Stock']:
+                out['Stock'] = pd.to_numeric(
+                    df[mapping['Stock']]
+                    .astype(str)
+                    .str.replace(',', '', regex=False),
+                    errors='coerce'
+                )
+
+            out['Source File'] = file.name
+            out['Source Sheet'] = sheet_name
+            out['Source Row'] = list(
+                range(header_index + 2,
+                      header_index + 2 + len(out))
+            )
+
+            out = out[
+                (out['SKU'] != '') &
+                (out['Description'] != '') &
+                out['Unit Price'].notna()
+            ]
+
+            if not out.empty:
+                candidates.append(out)
+
+    if not candidates:
+        raise ValueError(
+            'No recognizable catalogue table found. '
+            'Manual column mapping is required.'
+        )
+
+    return pd.concat(candidates, ignore_index=True)
+
     return out[(out['SKU'] != '') & (out['Description'] != '')].reset_index(drop=True)
 
 
