@@ -1,8 +1,8 @@
 import io
 import json
 import re
-from difflib import SequenceMatcher
 from datetime import date, timedelta
+from difflib import SequenceMatcher
 
 import pandas as pd
 import streamlit as st
@@ -35,121 +35,60 @@ def read_tabular(file, header=0):
     return pd.read_csv(data, dtype=str, header=header, encoding='utf-8-sig').fillna('')
 
 
-
 def parse_catalogue(file):
     aliases = {
-        'SKU': [
-            'sku', 'product code', 'item code', 'part number',
-            'part no', 'part no.', 'code', 'item number',
-            'material code', 'article number', 'артикул',
-            'код товара', 'код', 'номер детали', 'šifra',
-            'sifra', 'kataloški broj'
-        ],
-        'Description': [
-            'description', 'product name', 'item name',
-            'product', 'item description', 'material description',
-            'наименование', 'описание', 'название товара',
-            'naziv', 'opis', 'naziv proizvoda'
-        ],
-        'Unit Price': [
-            'unit price', 'price', 'rate', 'usd/pc',
-            'price usd', 'unit cost', 'cost', 'цена',
-            'цена usd', 'цена за шт', 'cena',
-            'jedinična cena', 'jedinicna cena'
-        ],
-        'Stock': [
-            'stock', 'available qty', 'available quantity',
-            'inventory', 'balance', 'остаток',
-            'остаток на складе', 'наличие',
-            'stanje', 'zalihe', 'količina na stanju'
-        ]
+        'SKU': ['sku', 'product code', 'item code', 'part number', 'part no', 'part no.',
+                'code', 'item number', 'material code', 'article number', 'артикул',
+                'код товара', 'код', 'номер детали', 'šifra', 'sifra', 'kataloški broj'],
+        'Description': ['description', 'product name', 'item name', 'product',
+                        'item description', 'material description', 'наименование',
+                        'описание', 'название товара', 'naziv', 'opis', 'naziv proizvoda'],
+        'Unit Price': ['unit price', 'price', 'rate', 'usd/pc', 'price usd',
+                       'unit cost', 'cost', 'цена', 'цена usd', 'цена за шт',
+                       'cena', 'jedinična cena', 'jedinicna cena'],
+        'Stock': ['stock', 'available qty', 'available quantity', 'inventory',
+                  'balance', 'остаток', 'остаток на складе', 'наличие',
+                  'stanje', 'zalihe', 'količina na stanju']
     }
-
     if file.name.lower().endswith('.xlsx'):
-        sheets = pd.read_excel(
-            io.BytesIO(file.getvalue()),
-            sheet_name=None,
-            header=None,
-            dtype=str,
-            engine='openpyxl'
-        )
+        sheets = pd.read_excel(io.BytesIO(file.getvalue()), sheet_name=None,
+                               header=None, dtype=str, engine='openpyxl')
     else:
-        sheets = {
-            'CSV': pd.read_csv(
-                io.BytesIO(file.getvalue()),
-                header=None,
-                dtype=str,
-                encoding='utf-8-sig'
-            )
-        }
-
+        sheets = {'CSV': pd.read_csv(io.BytesIO(file.getvalue()), header=None,
+                                     dtype=str, encoding='utf-8-sig')}
     candidates = []
-
     for sheet_name, raw in sheets.items():
         raw = raw.fillna('')
-
         for header_index in range(min(20, len(raw))):
-            headers = [
-                str(value).strip()
-                for value in raw.iloc[header_index]
-            ]
-
-            mapping = {
-                field: colname(headers, choices)
-                for field, choices in aliases.items()
-            }
-
-            if not all(mapping.get(k) for k in
-                       ['SKU', 'Description', 'Unit Price']):
+            headers = [str(v).strip() for v in raw.iloc[header_index]]
+            mapping = {field: colname(headers, choices) for field, choices in aliases.items()}
+            if not all(mapping.get(k) for k in ['SKU', 'Description', 'Unit Price']):
                 continue
-
+            # Avoid ambiguous columns and repeated detection of the same table.
+            required = [mapping[k] for k in ['SKU', 'Description', 'Unit Price']]
+            if len(set(required)) != 3 or len(set(headers)) != len(headers):
+                continue
             df = raw.iloc[header_index + 1:].copy()
             df.columns = headers
-
             out = pd.DataFrame({
                 'SKU': df[mapping['SKU']].astype(str).str.strip().str.upper(),
                 'Description': df[mapping['Description']].astype(str).str.strip(),
-                'Unit Price': pd.to_numeric(
-                    df[mapping['Unit Price']]
-                    .astype(str)
-                    .str.replace(',', '', regex=False),
-                    errors='coerce'
-                )
+                'Unit Price': pd.to_numeric(df[mapping['Unit Price']].astype(str)
+                                            .str.replace(',', '', regex=False), errors='coerce')
             })
-
-            if mapping['Stock']:
-                out['Stock'] = pd.to_numeric(
-                    df[mapping['Stock']]
-                    .astype(str)
-                    .str.replace(',', '', regex=False),
-                    errors='coerce'
-                )
-
+            if mapping['Stock'] and mapping['Stock'] not in required:
+                out['Stock'] = pd.to_numeric(df[mapping['Stock']].astype(str)
+                                             .str.replace(',', '', regex=False), errors='coerce')
             out['Source File'] = file.name
             out['Source Sheet'] = sheet_name
-            out['Source Row'] = list(
-                range(header_index + 2,
-                      header_index + 2 + len(out))
-            )
-
-            out = out[
-                (out['SKU'] != '') &
-                (out['Description'] != '') &
-                out['Unit Price'].notna()
-            ]
-
+            out['Source Row'] = list(range(header_index + 2, header_index + 2 + len(out)))
+            out = out[(out['SKU'] != '') & (out['Description'] != '') & out['Unit Price'].notna()]
             if not out.empty:
                 candidates.append(out)
-
+                break  # One recognized table per sheet; do not duplicate products.
     if not candidates:
-        raise ValueError(
-            'No recognizable catalogue table found. '
-            'Manual column mapping is required.'
-        )
-
+        raise ValueError('No recognizable catalogue table found. Manual column mapping is required.')
     return pd.concat(candidates, ignore_index=True)
-
-    return out[(out['SKU'] != '') & (out['Description'] != '')].reset_index(drop=True)
 
 
 QTY_RE = re.compile(r'^(.*?)\s*[,;\t]\s*(\d+(?:\.\d+)?)\s*(?:pcs?|pieces?|ea|each|units?|nos?\.?|sets?|m|meters?)?\s*$', re.I)
@@ -163,8 +102,7 @@ def parse_lines(text):
         m = QTY_RE.match(raw.strip()) or QTY_SPACE_RE.match(raw.strip())
         if not m:
             continue
-        item = m.group(1).strip(' ,;\t')
-        qty = float(m.group(2))
+        item, qty = m.group(1).strip(' ,;\t'), float(m.group(2))
         if not item or qty <= 0 or norm(item) in ('sku', 'description', 'item'):
             continue
         sku = item.upper() if SKU_RE.fullmatch(item) else ''
@@ -265,7 +203,6 @@ def compliance(request_text, offered_text):
 
 
 def general_attributes(description):
-    """Conservative detection of explicitly stated general-product attributes."""
     t = norm(description).replace('×', 'x')
     patterns = {
         'Power (W)': r'(?<![\w.])(\d+(?:\.\d+)?)\s*w\b',
@@ -310,14 +247,11 @@ def general_compliance(request_text, offered_text):
     return 'Compatible', 'Exact normalized description; manual verification still required', pd.DataFrame(details)
 
 
-
 def safe_compliance(request_text, offered_text):
-    """Mode-independent safety check. Unrecognized categories require exact descriptions."""
     industrial_req = specs(request_text).get('family')
     industrial_off = specs(offered_text).get('family')
     if industrial_req and industrial_off and industrial_req == industrial_off:
         status, note, details = compliance(request_text, offered_text)
-        # General numeric attributes are checked too, even in industrial mode.
         req_attrs = general_attributes(request_text)
         off_attrs = general_attributes(offered_text)
         conflicts = []
@@ -327,15 +261,15 @@ def safe_compliance(request_text, offered_text):
         if conflicts:
             return 'Non-compliant', '; '.join(conflicts), details
         return status, note, details
-    # No recognized matching industrial family: conservative general-product check.
     return general_compliance(request_text, offered_text)
+
 
 def find_general_product(sku, description, catalogue):
     if sku:
-        found = catalogue[catalogue['SKU'] == sku.upper()]
+        found = catalogue[(catalogue['SKU'] == sku.upper()) | (catalogue['Supplier SKU'] == sku.upper())]
         if len(found) == 1:
             return found.iloc[0], 100, 'Exact SKU — verify specification', False
-        return None, 0, 'Duplicate SKU' if len(found) > 1 else 'SKU not found', False
+        return None, 0, 'Ambiguous SKU across suppliers' if len(found) > 1 else 'SKU not found', False
     if not description or catalogue.empty:
         return None, 0, 'No description or catalogue', False
     ranked = [(SequenceMatcher(None, norm(description), norm(row['Description'])).ratio(), row)
@@ -349,17 +283,16 @@ def find_general_product(sku, description, catalogue):
 
 def find_product(sku, description, catalogue):
     if sku:
-        found = catalogue[catalogue['SKU'] == sku.upper()]
+        found = catalogue[(catalogue['SKU'] == sku.upper()) | (catalogue['Supplier SKU'] == sku.upper())]
         if len(found) == 1:
             return found.iloc[0], 100, 'Exact SKU', False
-        return None, 0, 'Duplicate SKU' if len(found) > 1 else 'SKU not found', False
+        return None, 0, 'Ambiguous SKU across suppliers' if len(found) > 1 else 'SKU not found', False
     if not description or catalogue.empty:
         return None, 0, 'No description or catalogue', False
     ranked = []
     requested_family = specs(description)['family']
     for _, product in catalogue.iterrows():
         offered_family = specs(product['Description'])['family']
-        # Never suggest a known different product family as an alternative.
         if requested_family and offered_family and requested_family != offered_family:
             continue
         if requested_family and not offered_family:
@@ -398,10 +331,7 @@ def excel_export(df, matrix, deviations, currency):
     return output.getvalue()
 
 
-
-
 def commercial_lines(result, mode='Industrial piping & valves'):
-    """Independent export gate: never trust the editor's Approved/Compliance flags alone."""
     safe = result['Approved'].eq(True) & result['Compliance'].eq('Compatible')
     safe &= result['Matched SKU'].astype(str).str.strip().ne('')
     safe &= result['Quantity'].gt(0) & result['Unit Price'].ge(0)
@@ -417,12 +347,12 @@ def commercial_lines(result, mode='Industrial piping & valves'):
 
 def commercial_excel(lines, meta, currency):
     output = io.BytesIO()
-    cols = ['Matched SKU', 'Matched Description', 'Quantity', 'Unit Price', 'Total']
+    cols = ['Supplier', 'Supplier SKU', 'Matched Description', 'Quantity', 'Unit Price', 'Total']
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        lines[cols].rename(columns={'Matched SKU': 'SKU', 'Matched Description': 'Description'}).to_excel(
+        lines[cols].rename(columns={'Supplier SKU': 'SKU', 'Matched Description': 'Description'}).to_excel(
             writer, sheet_name='Quotation', index=False, startrow=12)
         ws = writer.sheets['Quotation']
-        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.styles import Font, PatternFill
         ws['A1'] = 'QUOTATION — DRAFT / SUBJECT TO FINAL REVIEW'
         ws['A1'].font = Font(size=16, bold=True, color='17365D')
         fields = [('Seller', 'seller'), ('Customer', 'customer'), ('Quotation No.', 'number'),
@@ -432,20 +362,19 @@ def commercial_excel(lines, meta, currency):
         for row_no, (label, key) in enumerate(fields, 3):
             ws.cell(row_no, 1, label).font = Font(bold=True)
             ws.cell(row_no, 2, str(info.get(key, '') or ''))
-        header_row = 13
-        for cell in ws[header_row]:
+        for cell in ws[13]:
             cell.fill = PatternFill('solid', fgColor='17365D')
             cell.font = Font(bold=True, color='FFFFFF')
-        for col, width in {'A': 18, 'B': 62, 'C': 16, 'D': 18, 'E': 20}.items():
+        for col, width in {'A': 26, 'B': 18, 'C': 62, 'D': 16, 'E': 18, 'F': 20}.items():
             ws.column_dimensions[col].width = width
         for r in range(14, 14 + len(lines)):
-            ws.cell(r, 4).number_format = '#,##0.00'
             ws.cell(r, 5).number_format = '#,##0.00'
+            ws.cell(r, 6).number_format = '#,##0.00'
         total_row = 14 + len(lines)
-        ws.cell(total_row, 4, 'TOTAL').font = Font(bold=True)
-        ws.cell(total_row, 5, float(lines['Total'].sum())).font = Font(bold=True)
-        ws.cell(total_row, 5).number_format = '#,##0.00'
-        ws.freeze_panes = 'C14'
+        ws.cell(total_row, 5, 'TOTAL').font = Font(bold=True)
+        ws.cell(total_row, 6, float(lines['Total'].sum())).font = Font(bold=True)
+        ws.cell(total_row, 6).number_format = '#,##0.00'
+        ws.freeze_panes = 'D14'
         ws.print_options.horizontalCentered = True
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.page_setup.fitToWidth = 1
@@ -453,10 +382,9 @@ def commercial_excel(lines, meta, currency):
 
 
 def commercial_pdf(lines, meta, currency, logo_bytes=None):
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, KeepTogether
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
     from reportlab.lib import colors
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_RIGHT
     from reportlab.lib.utils import ImageReader
     from reportlab.lib.units import mm
     from xml.sax.saxutils import escape
@@ -467,8 +395,11 @@ def commercial_pdf(lines, meta, currency, logo_bytes=None):
     body = ParagraphStyle('QFBody', parent=styles['BodyText'], fontSize=9, leading=12, spaceAfter=4)
     small = ParagraphStyle('QFSmall', parent=body, fontSize=8, leading=10)
     heading = ParagraphStyle('QFHeading', parent=styles['Heading1'], fontSize=19, textColor=colors.HexColor('#17365D'))
+    header = ParagraphStyle('QFHeader', parent=small, textColor=colors.white, fontName='Helvetica-Bold')
+
     def para(value, style=body):
         return Paragraph(escape(str(value or '')).replace('\n', '<br/>'), style)
+
     story = []
     if logo_bytes:
         try:
@@ -476,41 +407,37 @@ def commercial_pdf(lines, meta, currency, logo_bytes=None):
             iw, ih = ImageReader(io.BytesIO(logo_bytes)).getSize()
             factor = min(42*mm / iw, 18*mm / ih)
             img.drawWidth, img.drawHeight = iw * factor, ih * factor
-            story.append(img)
-            story.append(Spacer(1, 5*mm))
+            story.extend([img, Spacer(1, 5*mm)])
         except Exception:
             pass
     story += [para('QUOTATION', heading), para('DRAFT — SUBJECT TO FINAL COMMERCIAL AND TECHNICAL REVIEW', small), Spacer(1, 5*mm)]
     parties = Table([[para('FROM / SELLER', small), para('BILL TO / CUSTOMER', small)],
-                     [para(meta['seller']), para(meta['customer'])]],
-                    colWidths=[89*mm, 89*mm], hAlign='LEFT')
-    parties.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#E9F0F8')),
-                                 ('VALIGN',(0,0),(-1,-1),'TOP'),
-                                 ('TOPPADDING',(0,0),(-1,-1),7),
-                                 ('BOTTOMPADDING',(0,0),(-1,-1),7)]))
+                     [para(meta['seller']), para(meta['customer'])]], colWidths=[89*mm, 89*mm], hAlign='LEFT')
+    parties.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E9F0F8')),
+                                 ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                 ('TOPPADDING', (0, 0), (-1, -1), 7),
+                                 ('BOTTOMPADDING', (0, 0), (-1, -1), 7)]))
     story.extend([parties, Spacer(1, 6*mm)])
     for label, key in [('Quotation No.', 'number'), ('Date', 'date'), ('Valid Until', 'valid_until')]:
         if meta.get(key):
             story.append(para(f'{label}: {meta[key]}', small))
     story.append(Spacer(1, 6*mm))
-    widths = [11*mm, 20*mm, 76*mm, 16*mm, 26*mm, 29*mm]
-    data = [[para(x, small) for x in ['No.', 'SKU', 'Description', 'Qty', f'Unit ({currency})', f'Total ({currency})']]]
+    widths = [10*mm, 25*mm, 17*mm, 63*mm, 13*mm, 24*mm, 26*mm]
+    data = [[para(x, header) for x in ['No.', 'Supplier', 'SKU', 'Description', 'Qty', f'Unit ({currency})', f'Total ({currency})']]]
     for no, (_, item) in enumerate(lines.iterrows(), 1):
-        data.append([para(no, small), para(item['Matched SKU'], small), para(item['Matched Description'], small),
-                     para(f'{float(item["Quantity"]):g}', small),
+        data.append([para(no, small), para(item['Supplier'], small), para(item['Supplier SKU'], small),
+                     para(item['Matched Description'], small), para(f'{float(item["Quantity"]):g}', small),
                      para(f'{float(item["Unit Price"]):,.2f}', small), para(f'{float(item["Total"]):,.2f}', small)])
-    data.append(['', '', '', '', para('TOTAL', small), para(f'{float(lines["Total"].sum()):,.2f}', small)])
+    data.append(['', '', '', '', '', para('TOTAL', small), para(f'{float(lines["Total"].sum()):,.2f}', small)])
     table = Table(data, colWidths=widths, repeatRows=1, hAlign='LEFT')
-    table.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor('#17365D')),
-                               ('TEXTCOLOR', (0,0), (-1,0), colors.white),
-                               ('ROWBACKGROUNDS', (0,1), (-1,-2), [colors.white, colors.HexColor('#F2F5F9')]),
-                               ('LINEBELOW', (0,0), (-1,-1), .25, colors.HexColor('#D5DCE5')),
-                               ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                               ('LEFTPADDING', (0,0), (-1,-1), 5), ('RIGHTPADDING', (0,0), (-1,-1), 5),
-                               ('TOPPADDING', (0,0), (-1,-1), 6), ('BOTTOMPADDING', (0,0), (-1,-1), 6)]))
-    # Header paragraphs need explicit white text; a cell-level TEXTCOLOR doesn't override Paragraph styling.
-    for cell in data[0]:
-        cell.style = ParagraphStyle('QFHeader', parent=small, textColor=colors.white, fontName='Helvetica-Bold')
+    table.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#17365D')),
+                               ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.white, colors.HexColor('#F2F5F9')]),
+                               ('LINEBELOW', (0, 0), (-1, -1), .25, colors.HexColor('#D5DCE5')),
+                               ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                               ('LEFTPADDING', (0, 0), (-1, -1), 5),
+                               ('RIGHTPADDING', (0, 0), (-1, -1), 5),
+                               ('TOPPADDING', (0, 0), (-1, -1), 6),
+                               ('BOTTOMPADDING', (0, 0), (-1, -1), 6)]))
     story.extend([table, Spacer(1, 7*mm)])
     for label, key in [('Delivery terms', 'delivery'), ('Payment terms', 'payment'), ('Additional notes', 'notes')]:
         value = str(meta.get(key) or '').strip()
@@ -522,7 +449,6 @@ def commercial_pdf(lines, meta, currency, logo_bytes=None):
     return output.getvalue()
 
 
-# Portable profiles and history; use JSON backup for persistence across sessions.
 if 'qf_records' not in st.session_state:
     st.session_state['qf_records'] = {'supplier': '', 'customers': {}, 'history': []}
 records = st.session_state['qf_records']
@@ -558,33 +484,26 @@ with st.expander('Customer & Supplier Management / Quotation History'):
                        'QuoteFast_Records_Backup.json', 'application/json')
 st.caption('Profiles/history remain in the current session only. Download JSON backup; permanent cloud storage is not yet configured.')
 
-industry_mode = st.selectbox('Product matching mode', ['Industrial piping & valves', 'General products (conservative matching)'], help='General mode allows exact-description matching; similar descriptions require manual review.')
+industry_mode = st.selectbox('Product matching mode', ['Industrial piping & valves', 'General products (conservative matching)'],
+                             help='General mode allows exact-description matching; similar descriptions require manual review.')
 st.caption('Matching mode affects suggestions only. Final compliance checks are independent of mode.')
-catalogue_files = st.file_uploader(
-    '1. Upload supplier catalogues (CSV or Excel)',
-    type=['csv', 'xlsx'],
-    accept_multiple_files=True
-)
+catalogue_files = st.file_uploader('1. Upload supplier catalogues (CSV or Excel)',
+                                   type=['csv', 'xlsx'], accept_multiple_files=True)
 rfq_file = st.file_uploader('2. Upload RFQ (Excel, CSV, PDF, Word)', type=['xlsx', 'csv', 'pdf', 'docx'])
 rfq_text = st.text_area('Or paste RFQ lines', height=140, placeholder='Gate valve, 4 inch, Class 600, 5 pcs')
 currency = st.selectbox('Currency', ['USD', 'EUR', 'GBP'])
+st.caption('Catalogue prices are assumed to be in the selected currency. No currency conversion is performed.')
 
-signature = (
-    tuple((f.name, f.getvalue()) for f in catalogue_files),
-    rfq_file.getvalue() if rfq_file else None,
-    rfq_text,
-    currency,
-    industry_mode
-)
+signature = (tuple((f.name, f.getvalue()) for f in catalogue_files),
+             rfq_file.getvalue() if rfq_file else None, rfq_text, currency, industry_mode)
 if st.session_state.get('signature') != signature:
     st.session_state['signature'] = signature
-    for key in ['draft', 'editor', 'catalogue_data', 'supplier_comparison']:
-    st.session_state.pop(key, None)
-
-if st.button('Generate Draft Quotation', type='primary'):
-    for key in ['draft', 'editor', 'catalogue_data', 'supplier_comparison']:
+    for key in ['draft', 'editor', 'catalogue_data', 'supplier_comparison', 'rfq_data']:
         st.session_state.pop(key, None)
 
+if st.button('Generate Draft Quotation', type='primary'):
+    for key in ['draft', 'editor', 'catalogue_data', 'supplier_comparison', 'rfq_data']:
+        st.session_state.pop(key, None)
     if not catalogue_files:
         st.warning('Upload at least one supplier catalogue first.')
     elif not rfq_file and not rfq_text.strip():
@@ -592,94 +511,90 @@ if st.button('Generate Draft Quotation', type='primary'):
     else:
         try:
             catalogue_parts = []
-
             for supplier_file in catalogue_files:
                 supplier_catalogue = parse_catalogue(supplier_file)
-
                 supplier_catalogue['Supplier'] = supplier_file.name
                 supplier_catalogue['Supplier SKU'] = supplier_catalogue['SKU']
-
-                supplier_catalogue['SKU'] = (
-                    'S' + str(len(catalogue_parts) + 1) + '-' +
-                    supplier_catalogue['SKU'].astype(str)
-                )
-
+                # Internal SKU is unique even when suppliers reuse original SKU values.
+                supplier_catalogue['SKU'] = ('S' + str(len(catalogue_parts) + 1) + '-' +
+                                             supplier_catalogue['SKU'].astype(str))
                 catalogue_parts.append(supplier_catalogue)
-
             catalogue = pd.concat(catalogue_parts, ignore_index=True)
-
+            # Duplicate SKU within one supplier remains ambiguous; don't silently choose.
+            duplicates = catalogue['SKU'].duplicated(keep=False)
+            if duplicates.any():
+                st.warning(f'{int(duplicates.sum())} catalogue row(s) have repeated SKU within a supplier. Manual review required.')
             rfq = parse_rfq(rfq_file) if rfq_file else parse_lines(rfq_text)
-
             if rfq.empty:
-                st.error('No RFQ lines recognized.')
+                st.error('No RFQ lines recognized. Example: Gate valve DN100 Class 300 A105, 3 pcs')
             else:
                 rows = []
-
+                finder = find_general_product if industry_mode.startswith('General') else find_product
                 for _, item in rfq.iterrows():
-                    finder = (
-                        find_general_product
-                        if industry_mode.startswith('General')
-                        else find_product
-                    )
-
-                    product, score, note, alternative = finder(
-                        item['Requested SKU'],
-                        item['Requested Description'],
-                        catalogue
-                    )
-
-                    rows.append({
-                        'Requested SKU': item['Requested SKU'],
-                        'Requested Description': item['Requested Description'],
-                        'Quantity': item['Quantity'],
-                        'Matched SKU': product['SKU'] if product is not None else '',
-                        'Matched Description': product['Description'] if product is not None else '',
-                        'Unit Price': (
-                            float(product['Unit Price'])
-                            if product is not None and pd.notna(product['Unit Price'])
-                            else None
-                        ),
-                        'Similarity %': score,
-                        'Match Note': note,
-                        'Approved': False
-                    })
-
+                    product, score, note, alternative = finder(item['Requested SKU'], item['Requested Description'], catalogue)
+                    rows.append({'Requested SKU': item['Requested SKU'],
+                                 'Requested Description': item['Requested Description'],
+                                 'Quantity': item['Quantity'],
+                                 'Matched SKU': product['SKU'] if product is not None else '',
+                                 'Matched Description': product['Description'] if product is not None else '',
+                                 'Unit Price': float(product['Unit Price']) if product is not None and pd.notna(product['Unit Price']) else None,
+                                 'Similarity %': score, 'Match Note': note, 'Approved': False})
                 st.session_state['catalogue_data'] = catalogue
                 st.session_state['supplier_comparison'] = catalogue.copy()
+                st.session_state['rfq_data'] = rfq
                 st.session_state['draft'] = pd.DataFrame(rows)
-
         except Exception as exc:
             st.error(f'Unable to process RFQ: {exc}')
 
-
 if 'supplier_comparison' in st.session_state:
     st.subheader('Multi-Supplier Catalogue Comparison')
-
     comparison = st.session_state['supplier_comparison']
+    columns = ['Supplier', 'Supplier SKU', 'SKU', 'Description', 'Unit Price',
+               'Stock', 'Source File', 'Source Sheet', 'Source Row']
+    st.dataframe(comparison[[c for c in columns if c in comparison.columns]],
+                 hide_index=True, use_container_width=True)
+    st.caption('SKU is the internal selection code; Supplier SKU is the original supplier code. Missing Stock means unknown, not zero.')
 
-    columns = [
-        'Supplier',
-        'Supplier SKU',
-        'Description',
-        'Unit Price',
-        'Stock',
-        'Source File',
-        'Source Sheet',
-        'Source Row'
-    ]
+    # Compare candidates for each RFQ item; do not infer technical certification.
+    comparison_rows = []
+    rfq_data = st.session_state['rfq_data']
+    for i, request in rfq_data.iterrows():
+        for _, product in comparison.iterrows():
+            requested_desc = str(request['Requested Description'])
+            offered_desc = str(product['Description'])
+            requested_sku = str(request['Requested SKU']).strip().upper()
+            if requested_sku and requested_sku not in (product['Supplier SKU'], product['SKU']):
+                continue
+            if not requested_sku:
+                score = SequenceMatcher(None, norm(requested_desc), norm(offered_desc)).ratio()
+                if score < 0.40:
+                    continue
+            else:
+                score = 1.0
+            status, _, _ = safe_compliance(requested_desc, offered_desc)
+            stock = product.get('Stock', float('nan'))
+            stock_state = 'Unknown' if pd.isna(stock) else ('Enough' if float(stock) >= float(request['Quantity']) else 'Insufficient')
+            comparison_rows.append({
+                'RFQ Line': i + 1, 'Requested': requested_desc or requested_sku,
+                'Supplier': product['Supplier'], 'Supplier SKU': product['Supplier SKU'],
+                'Selection SKU': product['SKU'], 'Offered Description': offered_desc,
+                'Compliance': status, 'Similarity %': round(score * 100),
+                'Quantity': request['Quantity'], 'Unit Price': product['Unit Price'],
+                'Extended Price': float(request['Quantity']) * float(product['Unit Price']),
+                'Stock Status': stock_state
+            })
+    if comparison_rows:
+        comparison_df = pd.DataFrame(comparison_rows).sort_values(
+            ['RFQ Line', 'Extended Price'], ascending=[True, True])
+        st.markdown('**RFQ-based supplier comparison (lowest price first within each line)**')
+        st.dataframe(comparison_df, hide_index=True, use_container_width=True)
+        st.caption('Check compliance, stock, delivery, freight, currency, and supplier terms before selecting. Use Selection SKU in the editor below.')
+    else:
+        st.info('No sufficiently similar supplier candidates found for this RFQ.')
 
-    available_columns = [
-        c for c in columns if c in comparison.columns
-    ]
-
-    st.dataframe(
-        comparison[available_columns],
-        hide_index=True,
-        use_container_width=True
-    )
 if 'draft' in st.session_state:
     st.subheader('3. Review and edit draft quotation')
-    st.caption('Change Matched SKU to select another product. Only Compatible lines can be approved. General-mode similar descriptions require review.')
+    st.caption('Change Matched SKU to a Selection SKU shown above. Only Compatible lines can be approved. General-mode similar descriptions require review.')
     edited = st.data_editor(st.session_state['draft'], hide_index=True, num_rows='fixed',
                             disabled=['Requested SKU', 'Requested Description', 'Matched Description',
                                       'Unit Price', 'Similarity %', 'Match Note'],
@@ -695,6 +610,8 @@ if 'draft' in st.session_state:
             line['Matched SKU'] = sku
             line['Matched Description'] = product['Description']
             line['Unit Price'] = product['Unit Price']
+            line['Supplier'] = product['Supplier']
+            line['Supplier SKU'] = product['Supplier SKU']
             if line['Requested Description']:
                 status, note, details = safe_compliance(line['Requested Description'], product['Description'])
             else:
@@ -702,15 +619,16 @@ if 'draft' in st.session_state:
         else:
             line['Matched Description'] = ''
             line['Unit Price'] = None
+            line['Supplier'] = ''
+            line['Supplier SKU'] = ''
             status = 'No match' if not sku else 'Invalid or duplicate SKU'
-            note = 'Choose one unique SKU from the catalogue'
+            note = 'Choose one unique Selection SKU from the comparison table'
             details = pd.DataFrame()
         line['Compliance'] = status
         line['Compliance Note'] = note
         line['Quantity'] = pd.to_numeric(line['Quantity'], errors='coerce')
         line['Unit Price'] = pd.to_numeric(line['Unit Price'], errors='coerce')
         line['Total'] = line['Quantity'] * line['Unit Price']
-        # Even if a user checks Approved, known technical conflicts are forcibly excluded.
         line['Approved'] = bool(line.get('Approved', False)) and status == 'Compatible' and len(matching) == 1
         rows.append(line)
         for _, detail in details.iterrows():
@@ -725,9 +643,10 @@ if 'draft' in st.session_state:
     result = pd.DataFrame(rows)
     matrix = pd.DataFrame(matrix_rows, columns=['RFQ Line', 'Matched SKU', 'Parameter', 'Requested', 'Offered', 'Result'])
     deviations = pd.DataFrame(deviation_rows, columns=['RFQ Line', 'Alternative SKU', 'Requested Description',
-                      'Alternative Description', 'Parameter', 'Requested', 'Offered', 'Decision'])
+                       'Alternative Description', 'Parameter', 'Requested', 'Offered', 'Decision'])
     st.subheader('4. Technical Compliance Matrix')
-    st.dataframe(result[['Requested Description', 'Matched SKU', 'Matched Description', 'Compliance', 'Compliance Note']],
+    st.dataframe(result[['Requested Description', 'Supplier', 'Supplier SKU', 'Matched SKU',
+                         'Matched Description', 'Compliance', 'Compliance Note']],
                  hide_index=True, use_container_width=True)
     with st.expander('View parameter-by-parameter comparison', expanded=True):
         st.dataframe(matrix, hide_index=True, use_container_width=True)
@@ -748,7 +667,6 @@ if 'draft' in st.session_state:
                        file_name='QuoteFast_v010_Draft.xlsx',
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
-
     st.subheader('6. Professional Quotation — v0.10.0')
     st.caption('Customer-facing documents include only approved lines marked Compatible. Technical deviations stay in the internal workbook.')
     with st.expander('Quotation details', expanded=True):
@@ -765,7 +683,7 @@ if 'draft' in st.session_state:
             if st.button('Load selected customer') and customer_choice != '— Select —':
                 st.session_state['qf_customer'] = customer_choice + '\n' + records['customers'][customer_choice]
             customer = st.text_area('Customer details', placeholder='Customer company\nAddress\nContact', key='qf_customer')
-            date = st.date_input('Quotation date', key='qf_date')
+            quote_date = st.date_input('Quotation date', key='qf_date')
             payment = st.text_input('Payment terms', placeholder='e.g. 30 days net', key='qf_payment')
             notes = st.text_area('Additional notes', key='qf_notes')
         logo = st.file_uploader('Optional company logo (PNG/JPG)', type=['png', 'jpg', 'jpeg'], key='qf_logo')
@@ -775,7 +693,7 @@ if 'draft' in st.session_state:
         st.info('Approve at least one Compatible line above to generate a quotation.')
     else:
         meta = {'seller': seller, 'customer': customer, 'number': number,
-                'date': str(date), 'valid_until': str(valid_until),
+                'date': str(quote_date), 'valid_until': str(valid_until),
                 'delivery': delivery, 'payment': payment, 'notes': notes}
         st.metric('Customer quotation total', f"{currency} {approved_lines['Total'].sum():,.2f}")
         required_missing = []
@@ -785,14 +703,14 @@ if 'draft' in st.session_state:
             required_missing.append('Customer details')
         if not number.strip():
             required_missing.append('Quotation number')
-        if valid_until < date:
+        if valid_until < quote_date:
             required_missing.append('Valid until must not precede quotation date')
         if required_missing:
             st.error('Complete required fields before exporting: ' + ', '.join(required_missing))
         else:
             st.success('Required quotation details complete. Exports are ready.')
             if st.button('Save quotation to history'):
-                records['history'].append({'Quotation No.': number, 'Date': str(date),
+                records['history'].append({'Quotation No.': number, 'Date': str(quote_date),
                     'Customer': customer.splitlines()[0], 'Currency': currency,
                     'Total': round(float(approved_lines['Total'].sum()), 2),
                     'Approved lines': int(len(approved_lines))})
@@ -803,11 +721,13 @@ if 'draft' in st.session_state:
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button('Download Professional Quotation (PDF)', pdf,
-                                   file_name='QuoteFast_v010_Quotation.pdf', mime='application/pdf', disabled=bool(required_missing))
+                                   file_name='QuoteFast_v010_Quotation.pdf', mime='application/pdf',
+                                   disabled=bool(required_missing))
             with c2:
                 st.download_button('Download Professional Quotation (Excel)', xlsx,
                                    file_name='QuoteFast_v010_Quotation.xlsx',
-                                   mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', disabled=bool(required_missing))
+                                   mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                                   disabled=bool(required_missing))
         except ImportError as exc:
             st.error(f'Missing Python dependency: {exc}. Add reportlab to requirements.txt.')
         except Exception as exc:
