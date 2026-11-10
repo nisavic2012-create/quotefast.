@@ -274,7 +274,7 @@ def find_general_product(sku, description, catalogue):
         return None, 0, 'No description or catalogue', False
     ranked = [(SequenceMatcher(None, norm(description), norm(row['Description'])).ratio(), row)
               for _, row in catalogue.iterrows()]
-    score, product = max(ranked, key=lambda x: x[0])
+    score, product = max(ranked, key=lambda x: (x[0], -float(x[1]['Unit Price'])))
     if score < 0.55:
         return None, round(score * 100), 'No sufficiently similar candidate', False
     exact = norm(description) == norm(product['Description'])
@@ -303,7 +303,7 @@ def find_product(sku, description, catalogue):
         ranked.append((status, score, conflict_count, product))
     compatible = [x for x in ranked if x[0] != 'Non-compliant' and x[1] >= 0.40]
     if compatible:
-        status, score, _, product = max(compatible, key=lambda x: x[1])
+        status, score, _, product = max(compatible, key=lambda x: (x[1], -float(x[3]['Unit Price'])))
         return product, round(score * 100), 'Suggested match', False
     alternatives = [x for x in ranked if x[0] == 'Non-compliant' and x[1] >= 0.40]
     if alternatives:
@@ -573,6 +573,11 @@ if 'supplier_comparison' in st.session_state:
                     continue
             else:
                 score = 1.0
+            if requested_desc:
+                req_family = specs(requested_desc)['family']
+                off_family = specs(offered_desc)['family']
+                if req_family and off_family and req_family != off_family:
+                    continue
             status, _, _ = safe_compliance(requested_desc, offered_desc)
             stock = product.get('Stock', float('nan'))
             stock_state = 'Unknown' if pd.isna(stock) else ('Enough' if float(stock) >= float(request['Quantity']) else 'Insufficient')
@@ -610,6 +615,11 @@ if 'draft' in st.session_state:
                                       'Unit Price', 'Similarity %', 'Match Note'],
                             column_config={'Markup (%)': st.column_config.NumberColumn('Markup (%)', min_value=0.0, max_value=10000.0, step=1.0, format='%.2f')},
                             key='editor', use_container_width=True)
+    # Explicit confirmation persists editor values, including checkbox changes, before export.
+    if st.button('Confirm selected products, markup and approvals', type='primary'):
+        st.session_state['draft'] = edited.copy(deep=True)
+        st.session_state.pop('editor', None)
+        st.rerun()
     catalogue = st.session_state['catalogue_data']
     rows, matrix_rows, deviation_rows = [], [], []
     for i, row in edited.iterrows():
