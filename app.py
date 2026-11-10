@@ -335,6 +335,8 @@ def commercial_lines(result, mode='Industrial piping & valves'):
     safe = result['Approved'].eq(True) & result['Compliance'].eq('Compatible')
     safe &= result['Matched SKU'].astype(str).str.strip().ne('')
     safe &= result['Quantity'].gt(0) & result['Unit Price'].ge(0)
+    safe &= result['Selling Price'].ge(0) & result['Selling Total'].notna()
+    safe &= result['Markup (%)'].between(0, 10000)
     safe &= result['Requested Description'].astype(str).str.strip().ne('')
     for index, row in result.iterrows():
         if not safe.loc[index]:
@@ -347,9 +349,9 @@ def commercial_lines(result, mode='Industrial piping & valves'):
 
 def commercial_excel(lines, meta, currency):
     output = io.BytesIO()
-    cols = ['Supplier', 'Supplier SKU', 'Matched Description', 'Quantity', 'Unit Price', 'Total']
+    cols = ['Supplier SKU', 'Matched Description', 'Quantity', 'Selling Price', 'Selling Total']
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        lines[cols].rename(columns={'Supplier SKU': 'SKU', 'Matched Description': 'Description'}).to_excel(
+        lines[cols].rename(columns={'Supplier SKU': 'SKU', 'Matched Description': 'Description', 'Selling Price': 'Unit Price', 'Selling Total': 'Total'}).to_excel(
             writer, sheet_name='Quotation', index=False, startrow=12)
         ws = writer.sheets['Quotation']
         from openpyxl.styles import Font, PatternFill
@@ -365,16 +367,16 @@ def commercial_excel(lines, meta, currency):
         for cell in ws[13]:
             cell.fill = PatternFill('solid', fgColor='17365D')
             cell.font = Font(bold=True, color='FFFFFF')
-        for col, width in {'A': 26, 'B': 18, 'C': 62, 'D': 16, 'E': 18, 'F': 20}.items():
+        for col, width in {'A': 20, 'B': 65, 'C': 16, 'D': 18, 'E': 20}.items():
             ws.column_dimensions[col].width = width
         for r in range(14, 14 + len(lines)):
+            ws.cell(r, 4).number_format = '#,##0.00'
             ws.cell(r, 5).number_format = '#,##0.00'
-            ws.cell(r, 6).number_format = '#,##0.00'
         total_row = 14 + len(lines)
-        ws.cell(total_row, 5, 'TOTAL').font = Font(bold=True)
-        ws.cell(total_row, 6, float(lines['Total'].sum())).font = Font(bold=True)
-        ws.cell(total_row, 6).number_format = '#,##0.00'
-        ws.freeze_panes = 'D14'
+        ws.cell(total_row, 4, 'TOTAL').font = Font(bold=True)
+        ws.cell(total_row, 5, float(lines['Selling Total'].sum())).font = Font(bold=True)
+        ws.cell(total_row, 5).number_format = '#,##0.00'
+        ws.freeze_panes = 'C14'
         ws.print_options.horizontalCentered = True
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.page_setup.fitToWidth = 1
@@ -422,13 +424,13 @@ def commercial_pdf(lines, meta, currency, logo_bytes=None):
         if meta.get(key):
             story.append(para(f'{label}: {meta[key]}', small))
     story.append(Spacer(1, 6*mm))
-    widths = [10*mm, 25*mm, 17*mm, 63*mm, 13*mm, 24*mm, 26*mm]
-    data = [[para(x, header) for x in ['No.', 'Supplier', 'SKU', 'Description', 'Qty', f'Unit ({currency})', f'Total ({currency})']]]
+    widths = [11*mm, 24*mm, 92*mm, 13*mm, 19*mm, 19*mm]
+    data = [[para(x, header) for x in ['No.', 'SKU', 'Description', 'Qty', f'Unit ({currency})', f'Total ({currency})']]]
     for no, (_, item) in enumerate(lines.iterrows(), 1):
-        data.append([para(no, small), para(item['Supplier'], small), para(item['Supplier SKU'], small),
+        data.append([para(no, small), para(item['Supplier SKU'], small),
                      para(item['Matched Description'], small), para(f'{float(item["Quantity"]):g}', small),
-                     para(f'{float(item["Unit Price"]):,.2f}', small), para(f'{float(item["Total"]):,.2f}', small)])
-    data.append(['', '', '', '', '', para('TOTAL', small), para(f'{float(lines["Total"].sum()):,.2f}', small)])
+                     para(f'{float(item["Selling Price"]):,.2f}', small), para(f'{float(item["Selling Total"]):,.2f}', small)])
+    data.append(['', '', '', '', para('TOTAL', small), para(f'{float(lines["Selling Total"].sum()):,.2f}', small)])
     table = Table(data, colWidths=widths, repeatRows=1, hAlign='LEFT')
     table.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#17365D')),
                                ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.white, colors.HexColor('#F2F5F9')]),
@@ -595,9 +597,18 @@ if 'supplier_comparison' in st.session_state:
 if 'draft' in st.session_state:
     st.subheader('3. Review and edit draft quotation')
     st.caption('Change Matched SKU to a Selection SKU shown above. Only Compatible lines can be approved. General-mode similar descriptions require review.')
+    st.caption('Markup is a percentage added to purchase cost (not gross profit margin).')
+    default_markup = st.number_input('Apply markup (%) to all RFQ lines', min_value=0.0, max_value=10000.0, value=0.0, step=1.0, key='qf_default_markup')
+    if st.button('Apply markup to all lines'):
+        st.session_state['draft']['Markup (%)'] = float(default_markup)
+        st.session_state.pop('editor', None)
+        st.rerun()
+    if 'Markup (%)' not in st.session_state['draft'].columns:
+        st.session_state['draft']['Markup (%)'] = 0.0
     edited = st.data_editor(st.session_state['draft'], hide_index=True, num_rows='fixed',
                             disabled=['Requested SKU', 'Requested Description', 'Matched Description',
                                       'Unit Price', 'Similarity %', 'Match Note'],
+                            column_config={'Markup (%)': st.column_config.NumberColumn('Markup (%)', min_value=0.0, max_value=10000.0, step=1.0, format='%.2f')},
                             key='editor', use_container_width=True)
     catalogue = st.session_state['catalogue_data']
     rows, matrix_rows, deviation_rows = [], [], []
@@ -629,6 +640,13 @@ if 'draft' in st.session_state:
         line['Quantity'] = pd.to_numeric(line['Quantity'], errors='coerce')
         line['Unit Price'] = pd.to_numeric(line['Unit Price'], errors='coerce')
         line['Total'] = line['Quantity'] * line['Unit Price']
+        line['Markup (%)'] = pd.to_numeric(line.get('Markup (%)', 0), errors='coerce')
+        if pd.notna(line['Markup (%)']) and 0 <= line['Markup (%)'] <= 10000:
+            line['Selling Price'] = round(float(line['Unit Price']) * (1 + float(line['Markup (%)']) / 100), 2) if pd.notna(line['Unit Price']) else float('nan')
+        else:
+            line['Selling Price'] = float('nan')
+        line['Selling Total'] = line['Quantity'] * line['Selling Price']
+        line['Gross Profit'] = line['Selling Total'] - line['Total']
         line['Approved'] = bool(line.get('Approved', False)) and status == 'Compatible' and len(matching) == 1
         rows.append(line)
         for _, detail in details.iterrows():
@@ -658,7 +676,10 @@ if 'draft' in st.session_state:
         st.dataframe(deviations, hide_index=True, use_container_width=True)
     eligible_indices = commercial_lines(result, industry_mode).index
     valid = result.index.isin(eligible_indices)
-    st.metric('Approved subtotal', f"{currency} {result.loc[valid, 'Total'].sum():,.2f}")
+    st.metric('Approved purchase subtotal', f"{currency} {result.loc[valid, 'Total'].sum():,.2f}")
+    st.metric('Approved selling subtotal', f"{currency} {result.loc[valid, 'Selling Total'].sum():,.2f}")
+    st.metric('Estimated gross profit', f"{currency} {result.loc[valid, 'Gross Profit'].sum():,.2f}")
+    st.dataframe(result[['Requested Description', 'Supplier', 'Supplier SKU', 'Unit Price', 'Markup (%)', 'Selling Price', 'Quantity', 'Selling Total', 'Gross Profit']], hide_index=True, use_container_width=True)
     st.caption(f"Unapproved priced subtotal (including alternatives): {currency} {result.loc[~valid, 'Total'].sum():,.2f}")
     if (~valid).any():
         st.warning(f"{int((~valid).sum())} line(s) remain unapproved. Do not issue as a final quotation.")
@@ -668,7 +689,7 @@ if 'draft' in st.session_state:
                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
     st.subheader('6. Professional Quotation — v0.10.0')
-    st.caption('Customer-facing documents include only approved lines marked Compatible. Technical deviations stay in the internal workbook.')
+    st.caption('Customer-facing documents show selling prices only; purchase costs, markup and supplier identities remain internal. Technical deviations stay in the internal workbook.')
     with st.expander('Quotation details', expanded=True):
         left, right = st.columns(2)
         with left:
@@ -695,7 +716,7 @@ if 'draft' in st.session_state:
         meta = {'seller': seller, 'customer': customer, 'number': number,
                 'date': str(quote_date), 'valid_until': str(valid_until),
                 'delivery': delivery, 'payment': payment, 'notes': notes}
-        st.metric('Customer quotation total', f"{currency} {approved_lines['Total'].sum():,.2f}")
+        st.metric('Customer quotation total', f"{currency} {approved_lines['Selling Total'].sum():,.2f}")
         required_missing = []
         if not seller.strip():
             required_missing.append('Seller / company details')
@@ -712,7 +733,7 @@ if 'draft' in st.session_state:
             if st.button('Save quotation to history'):
                 records['history'].append({'Quotation No.': number, 'Date': str(quote_date),
                     'Customer': customer.splitlines()[0], 'Currency': currency,
-                    'Total': round(float(approved_lines['Total'].sum()), 2),
+                    'Total': round(float(approved_lines['Selling Total'].sum()), 2),
                     'Approved lines': int(len(approved_lines))})
                 st.success('Saved for this session. Download JSON backup to retain it.')
         try:
