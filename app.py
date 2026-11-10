@@ -1,4 +1,7 @@
 import io
+import hashlib
+import zipfile
+from datetime import datetime
 import json
 import re
 from datetime import date, timedelta
@@ -486,17 +489,124 @@ with st.expander('Customer & Supplier Management / Quotation History'):
                        'QuoteFast_Records_Backup.json', 'application/json')
 st.caption('Profiles/history remain in the current session only. Download JSON backup; permanent cloud storage is not yet configured.')
 
+# Supplier catalogue library: session storage with portable ZIP backup.
+# Streamlit Community Cloud filesystem is ephemeral; no permanent server persistence is claimed.
+if 'qf_supplier_library' not in st.session_state:
+    st.session_state['qf_supplier_library'] = {}
+supplier_library = st.session_state['qf_supplier_library']
+
+
+def supplier_backup(library):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+        manifest = []
+        for catalogue_id, entry in library.items():
+            filename = f'catalogues/{catalogue_id}{entry["extension"]}'
+            z.writestr(filename, entry['bytes'])
+            manifest.append({k: v for k, v in entry.items() if k != 'bytes'} | {'archive_path': filename})
+        z.writestr('manifest.json', json.dumps({'format': 'QF-supplier-library-1',
+                                               'catalogues': manifest}, ensure_ascii=False, indent=2))
+    return out.getvalue()
+
+
+with st.expander('Supplier Database / Catalogue Library', expanded=False):
+    st.caption('Session library with ZIP backup. The server does NOT guarantee permanent storage; download a backup before leaving.')
+    supplier_name = st.text_input('Supplier name for new catalogues', key='qf_library_supplier')
+    catalogue_date = st.date_input('Catalogue price date', value=date.today(), key='qf_library_date')
+    library_uploads = st.file_uploader('Add original supplier Excel/CSV catalogues',
+                                       type=['xlsx', 'csv'], accept_multiple_files=True, key='qf_library_upload')
+    if st.button('Save uploaded catalogues to library'):
+        if not supplier_name.strip():
+            st.warning('Enter supplier name first.')
+        elif not library_uploads:
+            st.warning('Choose at least one catalogue.')
+        else:
+            added = 0
+            for f in library_uploads:
+                raw = f.getvalue()
+                try:
+                    parsed = parse_catalogue(f)
+                    digest = hashlib.sha256(raw).hexdigest()
+                    if digest in supplier_library:
+                        continue
+                    supplier_library[digest] = {
+                        'id': digest, 'supplier': supplier_name.strip(),
+                        'filename': f.name, 'extension': '.xlsx' if f.name.lower().endswith('.xlsx') else '.csv',
+                        'catalogue_date': str(catalogue_date),
+                        'uploaded_at': datetime.now().isoformat(timespec='seconds'),
+                        'products': len(parsed), 'bytes': raw
+                    }
+                    added += 1
+                except Exception as exc:
+                    st.error(f'{f.name}: {exc}')
+            if added:
+                st.success(f'{added} catalogue(s) added to session library. Download ZIP backup to retain them.')
+            else:
+                st.info('No new catalogues added.')
+
+    backup_upload = st.file_uploader('Restore catalogue library from ZIP backup', type=['zip'], key='qf_library_restore')
+    if st.button('Restore ZIP backup') and backup_upload:
+        try:
+            with zipfile.ZipFile(io.BytesIO(backup_upload.getvalue())) as z:
+                manifest = json.loads(z.read('manifest.json'))
+                if manifest.get('format') != 'QF-supplier-library-1':
+                    raise ValueError('Unsupported backup format')
+                entries = manifest.get('catalogues', [])
+                if len(entries) > 200:
+                    raise ValueError('Too many catalogues')
+                restored = {}
+                for entry in entries:
+                    path = entry['archive_path']
+                    if not path.startswith('catalogues/') or '..' in path or not path.endswith(('.xlsx', '.csv')):
+                        raise ValueError('Invalid archive path')
+                    if z.getinfo(path).file_size > 30_000_000:
+                        raise ValueError('Catalogue exceeds 30 MB')
+                    raw = z.read(path)
+                    digest = hashlib.sha256(raw).hexdigest()
+                    if digest != entry['id']:
+                        raise ValueError('Catalogue checksum mismatch')
+                    restored[digest] = {k: v for k, v in entry.items() if k != 'archive_path'} | {'bytes': raw}
+                supplier_library.update(restored)
+            st.success(f'Restored {len(restored)} catalogue(s) into this session.')
+        except Exception as exc:
+            st.error(f'Unable to restore backup: {exc}')
+
+    if supplier_library:
+        info = pd.DataFrame([{k: v for k, v in entry.items() if k not in ('bytes', 'id', 'extension')}
+                             for entry in supplier_library.values()])
+        st.dataframe(info, hide_index=True, use_container_width=True)
+        st.download_button('Download complete supplier library ZIP backup', supplier_backup(supplier_library),
+                           file_name='QuoteFast_Supplier_Library_Backup.zip', mime='application/zip')
+    else:
+        st.info('Library is empty. Add catalogues or restore a ZIP backup.')
+
 industry_mode = st.selectbox('Product matching mode', ['Industrial piping & valves', 'General products (conservative matching)'],
                              help='General mode allows exact-description matching; similar descriptions require manual review.')
 st.caption('Matching mode affects suggestions only. Final compliance checks are independent of mode.')
 catalogue_files = st.file_uploader('1. Upload supplier catalogues (CSV or Excel)',
                                    type=['csv', 'xlsx'], accept_multiple_files=True)
+library_options = {f'{entry["supplier"]} | {entry["filename"]} | {entry["catalogue_date"]} | {key[:8]}': key
+                   for key, entry in supplier_library.items()}
+selected_library = st.multiselect('Or select catalogues from Supplier Database', list(library_options))
+selected_entries = [supplier_library[library_options[label]] for label in selected_library]
+
+
+class StoredCatalogue:
+    def __init__(self, entry):
+        self.name = entry['filename']
+        self.entry = entry
+
+    def getvalue(self):
+        return self.entry['bytes']
+
+
+all_catalogue_files = list(catalogue_files) + [StoredCatalogue(entry) for entry in selected_entries]
 rfq_file = st.file_uploader('2. Upload RFQ (Excel, CSV, PDF, Word)', type=['xlsx', 'csv', 'pdf', 'docx'])
 rfq_text = st.text_area('Or paste RFQ lines', height=140, placeholder='Gate valve, 4 inch, Class 600, 5 pcs')
 currency = st.selectbox('Currency', ['USD', 'EUR', 'GBP'])
 st.caption('Catalogue prices are assumed to be in the selected currency. No currency conversion is performed.')
 
-signature = (tuple((f.name, f.getvalue()) for f in catalogue_files),
+signature = (tuple((f.name, hashlib.sha256(f.getvalue()).hexdigest()) for f in all_catalogue_files),
              rfq_file.getvalue() if rfq_file else None, rfq_text, currency, industry_mode)
 if st.session_state.get('signature') != signature:
     st.session_state['signature'] = signature
@@ -506,16 +616,17 @@ if st.session_state.get('signature') != signature:
 if st.button('Generate Draft Quotation', type='primary'):
     for key in ['draft', 'editor', 'catalogue_data', 'supplier_comparison', 'rfq_data']:
         st.session_state.pop(key, None)
-    if not catalogue_files:
+    if not all_catalogue_files:
         st.warning('Upload at least one supplier catalogue first.')
     elif not rfq_file and not rfq_text.strip():
         st.warning('Upload an RFQ or paste RFQ lines.')
     else:
         try:
             catalogue_parts = []
-            for supplier_file in catalogue_files:
+            for supplier_file in all_catalogue_files:
                 supplier_catalogue = parse_catalogue(supplier_file)
-                supplier_catalogue['Supplier'] = supplier_file.name
+                supplier_catalogue['Supplier'] = (supplier_file.entry['supplier'] if isinstance(supplier_file, StoredCatalogue) else supplier_file.name)
+                supplier_catalogue['Catalogue Date'] = (supplier_file.entry['catalogue_date'] if isinstance(supplier_file, StoredCatalogue) else 'Not specified')
                 supplier_catalogue['Supplier SKU'] = supplier_catalogue['SKU']
                 # Internal SKU is unique even when suppliers reuse original SKU values.
                 supplier_catalogue['SKU'] = ('S' + str(len(catalogue_parts) + 1) + '-' +
@@ -552,7 +663,7 @@ if 'supplier_comparison' in st.session_state:
     st.subheader('Multi-Supplier Catalogue Comparison')
     comparison = st.session_state['supplier_comparison']
     columns = ['Supplier', 'Supplier SKU', 'SKU', 'Description', 'Unit Price',
-               'Stock', 'Source File', 'Source Sheet', 'Source Row']
+               'Stock', 'Catalogue Date', 'Source File', 'Source Sheet', 'Source Row']
     st.dataframe(comparison[[c for c in columns if c in comparison.columns]],
                  hide_index=True, use_container_width=True)
     st.caption('SKU is the internal selection code; Supplier SKU is the original supplier code. Missing Stock means unknown, not zero.')
