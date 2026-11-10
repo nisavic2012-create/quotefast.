@@ -1,6 +1,9 @@
 import io
 import hashlib
 import zipfile
+import urllib.request
+import urllib.error
+import urllib.parse
 from datetime import datetime
 import json
 import re
@@ -11,6 +14,78 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title='QF | QuoteFast', page_icon='⚡', layout='wide')
+# Cloud mode is private: require an application password before showing supplier data.
+CLOUD_CONFIGURED = all(st.secrets.get(k) for k in ('SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'QF_APP_PASSWORD'))
+if st.secrets.get('SUPABASE_URL') and not CLOUD_CONFIGURED:
+    st.error('Cloud configuration incomplete. Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY and QF_APP_PASSWORD in Streamlit secrets.')
+    st.stop()
+if CLOUD_CONFIGURED:
+    import hmac
+    if not st.session_state.get('qf_authenticated', False):
+        pwd = st.text_input('QuoteFast private access password', type='password')
+        if st.button('Sign in'):
+            if hmac.compare_digest(pwd, str(st.secrets['QF_APP_PASSWORD'])):
+                st.session_state['qf_authenticated'] = True
+                st.rerun()
+            else:
+                st.error('Incorrect password')
+        st.stop()
+
+
+def cloud_request(method, endpoint, data=None, content_type='application/json', extra_headers=None):
+    url = str(st.secrets['SUPABASE_URL']).rstrip('/') + endpoint
+    key = str(st.secrets['SUPABASE_SERVICE_ROLE_KEY'])
+    headers = {'apikey': key, 'Authorization': 'Bearer ' + key}
+    if data is not None:
+        headers['Content-Type'] = content_type
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=35) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode('utf-8', errors='replace')[:400]
+        raise RuntimeError(f'Supabase HTTP {exc.code}: {detail}') from exc
+
+
+def cloud_load_library():
+    result = json.loads(cloud_request('GET', '/rest/v1/qf_catalogues?select=*&order=uploaded_at.desc'))
+    loaded = {}
+    for item in result:
+        digest = item['id']
+        ext = item['extension']
+        storage_path = urllib.parse.quote(digest + ext, safe='')
+        raw = cloud_request('GET', '/storage/v1/object/qf-catalogues/' + storage_path)
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise ValueError('Cloud file checksum mismatch: ' + item['filename'])
+        loaded[digest] = {
+            'id': digest, 'supplier': item['supplier'], 'filename': item['filename'],
+            'extension': ext, 'catalogue_date': item['catalogue_date'],
+            'uploaded_at': item['uploaded_at'], 'products': item['products'], 'bytes': raw
+        }
+    return loaded
+
+
+def cloud_save_entry(entry, parsed):
+    digest = entry['id']
+    ext = entry['extension']
+    cloud_request('POST', '/storage/v1/object/qf-catalogues/' + urllib.parse.quote(digest + ext, safe=''),
+                  entry['bytes'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' if ext == '.xlsx' else 'text/csv',
+                  {'x-upsert': 'true'})
+    normalized = json.loads(parsed.to_json(orient='records', date_format='iso'))
+    mapping = {'method': 'auto-detected', 'note': 'Original source sheet and row stored per normalized product'}
+    record = {
+        'id': digest, 'supplier': entry['supplier'], 'filename': entry['filename'],
+        'extension': ext, 'catalogue_date': entry['catalogue_date'],
+        'uploaded_at': entry['uploaded_at'], 'products': entry['products'],
+        'normalized_products': normalized, 'column_mapping': mapping
+    }
+    cloud_request('POST', '/rest/v1/qf_catalogues?on_conflict=id',
+                  json.dumps(record, ensure_ascii=False, allow_nan=False).encode('utf-8'),
+                  extra_headers={'Prefer': 'resolution=merge-duplicates,return=minimal'})
+
+
 st.title('⚡ QF | QuoteFast')
 st.caption('From RFQ to Quotation in Minutes — v0.10.0')
 st.warning('Prototype: rule-based suggestions are not technical certification. Verify all specifications manually.')
@@ -494,6 +569,23 @@ st.caption('Profiles/history remain in the current session only. Download JSON b
 if 'qf_supplier_library' not in st.session_state:
     st.session_state['qf_supplier_library'] = {}
 supplier_library = st.session_state['qf_supplier_library']
+if CLOUD_CONFIGURED and not st.session_state.get('qf_cloud_loaded'):
+    try:
+        supplier_library.update(cloud_load_library())
+        st.session_state['qf_cloud_loaded'] = True
+    except Exception as exc:
+        st.error(f'Could not load cloud supplier library: {exc}')
+        st.stop()
+
+
+
+class StoredCatalogueForRestore:
+    def __init__(self, entry):
+        self.name = entry['filename']
+        self._raw = entry['bytes']
+
+    def getvalue(self):
+        return self._raw
 
 
 def supplier_backup(library):
@@ -510,7 +602,8 @@ def supplier_backup(library):
 
 
 with st.expander('Supplier Database / Catalogue Library', expanded=False):
-    st.caption('Session library with ZIP backup. The server does NOT guarantee permanent storage; download a backup before leaving.')
+    st.caption('Cloud storage enabled: private Supabase database + original catalogue files.' if CLOUD_CONFIGURED
+               else 'Session-only library. Configure Supabase for permanent storage; download ZIP backup before leaving.')
     supplier_name = st.text_input('Supplier name for new catalogues', key='qf_library_supplier')
     catalogue_date = st.date_input('Catalogue price date', value=date.today(), key='qf_library_date')
     library_uploads = st.file_uploader('Add original supplier Excel/CSV catalogues',
@@ -536,11 +629,17 @@ with st.expander('Supplier Database / Catalogue Library', expanded=False):
                         'uploaded_at': datetime.now().isoformat(timespec='seconds'),
                         'products': len(parsed), 'bytes': raw
                     }
+                    if CLOUD_CONFIGURED:
+                        try:
+                            cloud_save_entry(supplier_library[digest], parsed)
+                        except Exception:
+                            supplier_library.pop(digest, None)
+                            raise
                     added += 1
                 except Exception as exc:
                     st.error(f'{f.name}: {exc}')
             if added:
-                st.success(f'{added} catalogue(s) added to session library. Download ZIP backup to retain them.')
+                st.success(f'{added} catalogue(s) saved to ' + ('permanent cloud storage.' if CLOUD_CONFIGURED else 'session library. Download ZIP backup.'))
             else:
                 st.info('No new catalogues added.')
 
@@ -566,6 +665,9 @@ with st.expander('Supplier Database / Catalogue Library', expanded=False):
                     if digest != entry['id']:
                         raise ValueError('Catalogue checksum mismatch')
                     restored[digest] = {k: v for k, v in entry.items() if k != 'archive_path'} | {'bytes': raw}
+                if CLOUD_CONFIGURED:
+                    for entry in restored.values():
+                        cloud_save_entry(entry, parse_catalogue(StoredCatalogueForRestore(entry)))
                 supplier_library.update(restored)
             st.success(f'Restored {len(restored)} catalogue(s) into this session.')
         except Exception as exc:
